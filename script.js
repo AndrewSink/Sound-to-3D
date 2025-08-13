@@ -10,6 +10,7 @@ const resetBtn = document.getElementById('resetBtn');
 const fileInput = document.getElementById('fileInput');
 const exportBtn = document.getElementById('exportBtn');
 const audioEl = document.getElementById('audioEl');
+const recordBtn = document.getElementById('recordBtn');
 
 // -------- Audio setup --------
 const audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -19,7 +20,8 @@ analyser.fftSize = 1024; // 512 freq bins
 const defaultSmoothing = 0.85;
 analyser.smoothingTimeConstant = defaultSmoothing;
 audioSource.connect(analyser);
-analyser.connect(audioContext.destination);
+// Route media element directly to output so the analyser does not feed speakers (for mic capture)
+audioSource.connect(audioContext.destination);
 
 const freqBinCount = analyser.frequencyBinCount; // 512
 const freqData = new Uint8Array(freqBinCount);
@@ -112,6 +114,61 @@ const material = new THREE.MeshLambertMaterial({
 const surface = new THREE.Mesh(geometry, material);
 surface.position.x = 0; // center over ground grid
 scene.add(surface);
+// Hide empty surface so the reference grid is visible until audio starts
+surface.visible = false;
+
+// -------- Reference grid (replaces flat grey plane) --------
+const gridGroup = new THREE.Group();
+scene.add(gridGroup);
+
+function clearGrid() {
+  while (gridGroup.children.length) {
+    const child = gridGroup.children.pop();
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) child.material.dispose && child.material.dispose();
+  }
+}
+
+function buildReferenceGrid(widthOverride, clipStartX = 0) {
+  clearGrid();
+  const widthWorld = (typeof widthOverride === 'number') ? widthOverride : sliceSpacing * (capacity - 1);
+  const z0 = zMin;
+  const z1 = zMax;
+  const y = -0.5; // push grid farther below to avoid any z-fighting
+
+  // Choose roughly even spacing that scales with size
+  const xDiv = Math.max(6, Math.round(widthWorld / (sliceSpacing * 64)) * 8);
+  const zDiv = 10;
+  const dx = widthWorld / xDiv;
+  const dz = (z1 - z0) / zDiv;
+  const startX = Math.max(0, Math.min(widthWorld, clipStartX));
+
+  const segments = [];
+  // Lines along X (vary Z)
+  for (let i = 0; i <= zDiv; i++) {
+    const z = z0 + dz * i;
+    segments.push(startX, y, z, widthWorld, y, z);
+  }
+  // Lines along Z (vary X)
+  for (let i = 0; i <= xDiv; i++) {
+    const x = dx * i;
+    if (x >= startX) {
+      segments.push(x, y, z0, x, y, z1);
+    }
+  }
+
+  const pos = new Float32Array(segments);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.LineBasicMaterial({ color: 0x3f3f46 });
+  // Keep grid color constant and allow strict occlusion
+  mat.depthTest = true;
+  mat.depthWrite = false;
+  mat.toneMapped = false;
+  mat.transparent = false;
+  const lines = new THREE.LineSegments(geo, mat);
+  gridGroup.add(lines);
+}
 
 // Removed helper ground grid
 
@@ -144,6 +201,8 @@ function applyZRowsToGeometry(geo, columnCapacity) {
   posAttr.needsUpdate = true;
 }
 applyZRowsToGeometry(geometry, capacity);
+// Build the reference grid once on initial load so it's visible before playback
+buildReferenceGrid(undefined, 0);
 
 // Maintain a continuous scroll by shifting historic columns left
 let isCapturing = false;
@@ -151,6 +210,13 @@ let hasEnded = false;
 const capturedSlices = []; // array of Float32Array(length: pointsPerSlice)
 const baseThickness = 4; // export base thickness (units ~ same as scene)
 const backThickness = 6; // small back slab thickness along -Z for printability
+
+// -------- Recording state (microphone) --------
+let isRecording = false;
+let micStream = null;
+let micSource = null;
+let mediaRecorder = null;
+let recordedChunks = [];
 
 function expandGeometry(newCapacity) {
   const oldGeometry = geometry;
@@ -190,6 +256,8 @@ function expandGeometry(newCapacity) {
 
   // Rebuild axes at the new right edge
   buildAxesAndTicks();
+  // Rebuild reference grid to match new width
+  buildReferenceGrid(sliceSpacing * (newCapacity - 1));
 }
 
 function updateSurfaceFromFrequencies() {
@@ -232,6 +300,17 @@ function updateSurfaceFromFrequencies() {
   currentSliceIndex++;
   positionAttr.needsUpdate = true;
   geometry.attributes.color.needsUpdate = true;
+
+  // Clip the grid under the generated portion of the model so no lines show through
+  const generatedWidth = Math.max(0, (currentSliceIndex - 1) * sliceSpacing);
+  buildReferenceGrid(sliceSpacing * (capacity - 1), generatedWidth + 0.5 * sliceSpacing);
+  // Ensure constant grid brightness regardless of scene state
+  gridGroup.traverse((obj) => {
+    if (obj.material && obj.material.isLineBasicMaterial) {
+      obj.material.toneMapped = false;
+      obj.material.needsUpdate = true;
+    }
+  });
 }
 
 // Color ramp designed to match the reference look:
@@ -335,7 +414,7 @@ function createTextSprite(text, options = {}) {
 function formatHzLabel(hz) {
   if (hz >= 1000) {
     const kilo = hz / 1000;
-    return (Math.abs(kilo - Math.round(kilo)) < 1e-6) ? `${Math.round(kilo)}k` : `${kilo.toFixed(1)}k`;
+    return `${Math.round(kilo)}k`;
   }
   return `${Math.round(hz)}`;
 }
@@ -365,9 +444,9 @@ function buildAxesAndTicks() {
   ]);
   axesGroup.add(new THREE.Line(zAxisGeometry, lineMaterial));
 
-  // Frequency tick marks and labels
+  // Frequency tick marks and labels (reduced low-frequency clutter)
   const nyquistHz = audioContext.sampleRate / 2;
-  const desiredFreqHz = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 15000];
+  const desiredFreqHz = [1000, 2000, 5000, 10000, 15000];
   const freqTickPoints = [];
   for (const hz of desiredFreqHz) {
     if (hz <= 0 || hz > nyquistHz) continue;
@@ -379,7 +458,7 @@ function buildAxesAndTicks() {
     freqTickPoints.push(new THREE.Vector3(axisX - 1.0, 0, zAtRow));
     freqTickPoints.push(new THREE.Vector3(axisX, 0, zAtRow));
 
-    const label = createTextSprite(formatHzLabel(hz), { worldHeight: 5 });
+    const label = createTextSprite(formatHzLabel(hz), { worldHeight: 3.5 });
     label.position.set(axisX - 1.25, 0.01, zAtRow);
     // Anchor so text sits to the left of the tick (right-aligned)
     label.center.set(1, 0.5);
@@ -400,7 +479,7 @@ function buildAxesAndTicks() {
     ampTickPoints.push(new THREE.Vector3(axisX - 1.2, yAtDb, backZ));
     ampTickPoints.push(new THREE.Vector3(axisX, yAtDb, backZ));
 
-    const label = createTextSprite(`${db}`, { worldHeight: 5 });
+    const label = createTextSprite(`${db}`, { worldHeight: 3.5 });
     label.position.set(axisX - 0.3, yAtDb, backZ);
     // Anchor to right-middle so text hugs the axis from the left side
     label.center.set(1, 0.5);
@@ -413,13 +492,13 @@ function buildAxesAndTicks() {
   }
 
   // Axis titles
-  const freqTitle = createTextSprite('Frequency (Hz)', { worldHeight: 5.5 });
+  const freqTitle = createTextSprite('Frequency (Hz)', { worldHeight: 4.5 });
   freqTitle.position.set(axisX - 3.2, 0.01, (backZ + frontActiveZ) / 2);
   freqTitle.center.set(0.5, 0.5);
   freqTitle.renderOrder = 2;
   axesGroup.add(freqTitle);
 
-  const ampTitle = createTextSprite('Amplitude (dB)', { worldHeight: 5.5 });
+  const ampTitle = createTextSprite('Amplitude (dB)', { worldHeight: 4.5 });
   ampTitle.position.set(axisX - 3.2, amplitudeMaxY, backZ);
   ampTitle.center.set(0.5, 0);
   ampTitle.renderOrder = 2;
@@ -432,19 +511,16 @@ buildAxesAndTicks();
 // Place the camera so the view centers between the axes (left) and the surface (center),
 // backed up and slightly orbiting to the right similar to the reference angle.
 function positionCameraOverview() {
-  // Axes are on the left near x=0; model grows to the right.
-  const targetX = (0 + sliceSpacing * 40) / 2; // slight bias into the surface
-  const targetY = depth * heightScale * 0.35;
+  // Straight-on view, grid framed slightly higher on screen
+  const targetX = sliceSpacing * 120;
+  const targetY = depth * heightScale * .2; // slightly higher center so grid sits more centered
   const targetZ = 0;
-
-  // Set the look target first
   controls.target.set(targetX, targetY, targetZ);
 
-  // Back the camera off and orbit a bit to the right of the target
   const amplitudeMaxY = depth * heightScale;
-  const dx = sliceSpacing * 120;  // right of target
-  const dy = amplitudeMaxY * 1.6;  // above target
-  const dz = sliceSpacing * 300;  // forward from target
+  const dx = 0;                  // no rightward orbit -> straight-on
+  const dy = amplitudeMaxY * 1.2; // modest elevation
+  const dz = sliceSpacing * 260;  // pull back to frame front area
   camera.position.set(targetX + dx, targetY + dy, targetZ + dz);
   controls.update();
   controls.saveState && controls.saveState();
@@ -454,6 +530,8 @@ positionCameraOverview();
 
 // Ensure the surface is visible before audio plays
 resetVisualization();
+
+// (Removed initial procedural preview per request)
 
 // Zooms out to fit the full model width while preserving the current angle.
 function frameWholeModel() {
@@ -477,8 +555,12 @@ let isRendering = true;
 function animate() {
   if (!isRendering) return;
   requestAnimationFrame(animate);
-  if (!audioEl.paused && !hasEnded) {
+  if ((isRecording || (!audioEl.paused && !hasEnded))) {
     updateSurfaceFromFrequencies();
+    // Reveal surface when data starts arriving
+    if (!surface.visible) surface.visible = true;
+    // When surface is visible, let depth testing occlude the grid naturally
+    gridGroup.traverse((obj) => { obj.renderOrder = 0; });
   }
   controls.update();
   renderer.render(scene, camera);
@@ -529,7 +611,104 @@ function setExportAvailability(enabled) {
   exportBtn.disabled = !enabled;
 }
 
+function setRecordButtonState(isRec) {
+  if (!recordBtn) return;
+  if (isRec) {
+    recordBtn.textContent = 'Stop Recording';
+    recordBtn.classList.remove('bg-rose-600', 'hover:bg-rose-500');
+    recordBtn.classList.add('bg-yellow-500', 'hover:bg-yellow-400');
+  } else {
+    recordBtn.textContent = 'Record Audio';
+    recordBtn.classList.remove('bg-yellow-500', 'hover:bg-yellow-400');
+    recordBtn.classList.add('bg-rose-600', 'hover:bg-rose-500');
+  }
+}
+
+async function startRecording() {
+  try {
+    if (audioContext.state === 'suspended') await audioContext.resume();
+    // Pause any element playback
+    try { audioEl.pause(); } catch { }
+
+    // Request mic
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // Feed mic only into analyser (not speakers)
+    micSource = audioContext.createMediaStreamSource(micStream);
+    micSource.connect(analyser);
+
+    // Reset visualization state
+    hasEnded = false;
+    isCapturing = true;
+    capturedSlices.length = 0;
+    hardResetVisualization();
+    flushAnalyser();
+    setExportAvailability(false);
+
+    // Recorder for saving to an audio file
+    recordedChunks = [];
+    let mimeType = '';
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+      mimeType = 'audio/webm;codecs=opus';
+    } else if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/webm')) {
+      mimeType = 'audio/webm';
+    } else if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/mp4')) {
+      mimeType = 'audio/mp4';
+    }
+    mediaRecorder = new MediaRecorder(micStream, mimeType ? { mimeType } : undefined);
+    mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      const type = mediaRecorder.mimeType || (mimeType || 'audio/webm');
+      const blob = new Blob(recordedChunks, { type });
+      const url = URL.createObjectURL(blob);
+      audioEl.src = url;
+      try { audioEl.load(); } catch { }
+      isCapturing = false;
+      isRecording = false;
+      disconnectMic();
+      finalizeModelGeometry();
+      frameWholeModel();
+      setRecordButtonState(false);
+      setExportAvailability(true);
+    };
+    mediaRecorder.start();
+
+    isRecording = true;
+    setRecordButtonState(true);
+  } catch (err) {
+    console.error('Recording failed', err);
+    // Best-effort cleanup
+    disconnectMic();
+    isRecording = false;
+    setRecordButtonState(false);
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    try { mediaRecorder.stop(); } catch { }
+  } else {
+    // No recorder; still cleanup mic
+    disconnectMic();
+    isRecording = false;
+    setRecordButtonState(false);
+  }
+}
+
+function stopRecordingIfActive() {
+  if (isRecording) stopRecording();
+}
+
+function disconnectMic() {
+  try { if (micSource) micSource.disconnect(); } catch { }
+  if (micStream) {
+    try { micStream.getTracks().forEach((t) => t.stop()); } catch { }
+  }
+  micSource = null;
+  micStream = null;
+}
+
 playBtn.addEventListener('click', async () => {
+  if (isRecording) return; // ignore play while recording to avoid mixing mic + file
   if (audioEl.paused) {
     if (audioContext.state === 'suspended') await audioContext.resume();
     try { await audioEl.play(); } catch (e) { /* ignore */ }
@@ -544,6 +723,7 @@ playBtn.addEventListener('click', async () => {
 });
 
 resetBtn.addEventListener('click', () => {
+  stopRecordingIfActive();
   audioEl.pause();
   audioEl.currentTime = 0;
   // Ensure browser seeks to start for both default and uploaded sources
@@ -559,6 +739,7 @@ resetBtn.addEventListener('click', () => {
 });
 
 fileInput.addEventListener('change', async (e) => {
+  stopRecordingIfActive();
   const file = e.target.files && e.target.files[0];
   if (!file) return;
   const url = URL.createObjectURL(file);
@@ -580,6 +761,7 @@ fileInput.addEventListener('change', async (e) => {
 window.addEventListener('dragover', (e) => { e.preventDefault(); });
 window.addEventListener('drop', (e) => {
   e.preventDefault();
+  stopRecordingIfActive();
   const file = e.dataTransfer.files && e.dataTransfer.files[0];
   if (!file) return;
   const url = URL.createObjectURL(file);
@@ -624,6 +806,16 @@ exportBtn.addEventListener('click', () => {
   downloadTextAsFile('dialup_spectrogram.obj', objText);
 });
 
+if (recordBtn) {
+  recordBtn.addEventListener('click', async () => {
+    if (!isRecording) {
+      await startRecording();
+    } else {
+      stopRecording();
+    }
+  });
+}
+
 // Rebuild the surface geometry to display the full captured model when playback finishes
 function finalizeModelGeometry() {
   const slices = capturedSlices.length;
@@ -659,6 +851,8 @@ function finalizeModelGeometry() {
   surface.geometry.dispose();
   geometry = newGeo;
   surface.geometry = geometry;
+  // Update grid to final width
+  buildReferenceGrid(finalWidth, finalWidth + 0.5 * sliceSpacing);
 }
 
 // If user exports before capture has enough slices, sample the on-screen geometry
@@ -979,7 +1173,7 @@ function downloadTextAsFile(filename, text) {
 // Clear the current visualization back to a flat plane and base color
 function resetVisualization() {
   const posArray = geometry.attributes.position.array;
-  const baseColor = { r: 0.15, g: 0.15, b: 0.15 }; // neutral gray, not red
+  const baseColor = { r: 0.0, g: 0.0, b: 0.0 }; // invisible black so grid shows through when hidden
   for (let i = 0; i < positionAttr.count; i++) {
     posArray[i * 3 + 1] = 0; // y
     const ci = i * 3;
@@ -991,6 +1185,10 @@ function resetVisualization() {
   geometry.attributes.color.needsUpdate = true;
   // Also clear any residual captured slices to avoid pre-populating export
   capturedSlices.length = 0;
+  // Hide surface until we start getting data so only grid is visible
+  surface.visible = false;
+  // Ensure grid renders below surface by resetting any modified order
+  gridGroup.traverse((obj) => { obj.renderOrder = 0; });
 }
 
 // Full reset: re-create the surface to initial capacity and clear indices
@@ -1006,6 +1204,7 @@ function hardResetVisualization() {
   surface.geometry = geometry;
   resetVisualization();
   buildAxesAndTicks();
+  buildReferenceGrid(undefined, 0);
   // Optionally recenters the view near the beginning
   positionCameraOverview();
 }
@@ -1014,6 +1213,7 @@ function hardResetVisualization() {
 window.addEventListener('beforeunload', () => {
   isRendering = false;
   try { audioEl.pause(); } catch { }
+  try { stopRecordingIfActive(); } catch { }
 });
 
 

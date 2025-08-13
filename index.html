@@ -4,8 +4,24 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>3D Spectrogram Generator</title>
-    <meta name="description" content="3D spectrogram visualizer for the classic dial‑up modem handshake sound." />
+    <title>Sound to 3D — 3D Spectrogram Generator</title>
+    <meta name="description"
+      content="Generate interactive 3D spectrograms from any audio or your microphone, then export 3D‑printable OBJ+MTL files." />
+    <link rel="canonical" href="https://soundto3d.xyz/" />
+    <meta name="robots" content="index,follow" />
+    <meta name="theme-color" content="#000000" />
+    <!-- Open Graph -->
+    <meta property="og:site_name" content="Sound to 3D" />
+    <meta property="og:title" content="Sound to 3D — 3D Spectrogram Generator" />
+    <meta property="og:description"
+      content="Generate interactive 3D spectrograms from any audio or your microphone, then export 3D‑printable OBJ+MTL files." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://soundto3d.xyz/" />
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Sound to 3D — 3D Spectrogram Generator" />
+    <meta name="twitter:description"
+      content="Generate interactive 3D spectrograms from any audio or your microphone, then export 3D‑printable OBJ+MTL files." />
     <link rel="preconnect" href="https://unpkg.com" crossorigin />
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
@@ -31,37 +47,86 @@
         }
       }
     </script>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebSite",
+        "name": "Sound to 3D",
+        "url": "https://soundto3d.xyz/",
+        "description": "Generate interactive 3D spectrograms from any audio or your microphone, then export 3D‑printable OBJ+MTL files.",
+        "creator": {
+          "@type": "Person",
+          "name": "Andrew Sink"
+        }
+      }
+    </script>
   </head>
 
   <body class="h-full">
     <div class="flex flex-col h-full">
-      <header class="px-4 py-3 bg-zinc-900/70 backdrop-blur text-sm flex items-center justify-between">
-        <div class="font-medium text-zinc-100">3D Spectrogram - 3D Model Generator</div>
+      <header class="sticky top-0 z-20 bg-zinc-950/70 backdrop-blur border-b border-zinc-800">
+        <div class="mx-auto max-w-7xl px-4 py-3 flex items-center justify-between">
+          <div class="flex items-center gap-3">
+            <div class="h-8 w-8 rounded-md bg-gradient-to-br from-emerald-400 to-indigo-500"></div>
+            <div class="text-sm sm:text-base font-medium text-zinc-100">Sound to 3D — 3D Spectrogram Generator</div>
+          </div>
+          <div class="hidden sm:flex items-center gap-4 text-xs">
+            <span class="text-zinc-400">Andrew Sink — 2025</span>
+            <a href="https://github.com/AndrewSink/Sound-to-3D" target="_blank" rel="noopener noreferrer"
+              class="text-zinc-300 hover:text-white underline underline-offset-2">GitHub</a>
+          </div>
+        </div>
       </header>
 
-      <main class="relative flex-1">
+      <main class="relative flex-1 overflow-hidden">
         <div id="canvas-container" class="absolute inset-0"></div>
 
-        <div
-          class="absolute left-4 right-4 bottom-4 flex flex-wrap items-center gap-3 p-3 rounded-lg bg-zinc-900/70 backdrop-blur border border-zinc-800">
-          <button id="toggleAxesBtn" class="px-3 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-white text-sm">Hide
-            Axes</button>
-          <button id="playBtn"
-            class="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-sm">Play</button>
-          <button id="resetBtn"
-            class="px-3 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-white text-sm">Reset</button>
-          <button id="exportBtn" disabled
-            class="px-3 py-1.5 rounded bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-indigo-500 text-white text-sm">
-            Export OBJ
-          </button>
+        <div class="absolute left-3 right-3 bottom-3 sm:left-6 sm:right-6 sm:bottom-6 z-10">
+          <div class="rounded-2xl border border-zinc-800 bg-zinc-900/80 backdrop-blur shadow-lg">
+            <div
+              class="px-3 py-2 sm:px-4 sm:py-3 flex flex-wrap items-center gap-2 sm:gap-3 justify-center sm:justify-between">
+              <div
+                class="flex items-center gap-2 sm:gap-3 w-full sm:w-auto order-2 sm:order-none justify-center sm:justify-start">
+                <button id="toggleAxesBtn" aria-label="Toggle axes"
+                  class="px-3 py-2 sm:px-4 sm:py-2.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-white text-sm">
+                  Hide Axes
+                </button>
+                <button id="resetBtn" aria-label="Reset visualization"
+                  class="px-3 py-2 sm:px-4 sm:py-2.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-white text-sm">
+                  Reset
+                </button>
+              </div>
 
-          <label class="ml-2 text-xs opacity-80">Load audio:</label>
-          <input id="fileInput" type="file" accept="audio/*"
-            class="text-xs file:mr-3 file:px-3 file:py-1.5 file:rounded file:border-0 file:text-xs file:bg-zinc-700 file:text-white hover:file:bg-zinc-600" />
+              <div class="flex items-center justify-center w-full sm:w-auto order-1">
+                <button id="playBtn" aria-label="Play or pause"
+                  class="px-5 py-2.5 sm:px-6 sm:py-3 rounded-full bg-emerald-600 hover:bg-emerald-500 text-white text-base font-medium">
+                  Play
+                </button>
+              </div>
 
-          <span class="ml-auto text-xs text-zinc-400">Andrew Sink - 2025</span>
-          <a href="https://github.com/AndrewSink/dialup_visualizer" target="_blank" rel="noopener noreferrer"
-            class="text-xs text-zinc-300 hover:text-white underline underline-offset-2">Full Code on Github</a>
+              <div class="flex items-center gap-2 sm:gap-3 w-full sm:w-auto order-3 justify-center sm:justify-end">
+                <input id="fileInput" type="file" accept="audio/*" class="sr-only" />
+                <label for="fileInput"
+                  class="px-3 py-2 sm:px-4 sm:py-2.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-white text-sm cursor-pointer select-none">
+                  Load Audio
+                </label>
+                <button id="recordBtn" aria-label="Record audio"
+                  class="px-3 py-2 sm:px-4 sm:py-2.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-sm">
+                  Record Audio
+                </button>
+                <button id="exportBtn" disabled aria-label="Export OBJ"
+                  class="px-3 py-2 sm:px-4 sm:py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm">
+                  Export OBJ
+                </button>
+              </div>
+            </div>
+          </div>
+          <div class="mt-2 flex items-center justify-between text-[10px] sm:text-xs text-zinc-400 px-1">
+            <div class="sm:hidden">Tap “Load Audio” or “Record Audio” to begin.</div>
+            <div class="hidden sm:block">Drag & drop an audio file anywhere to start.</div>
+            <a href="https://github.com/AndrewSink/Sound-to-3D" target="_blank" rel="noopener noreferrer"
+              class="sm:hidden underline underline-offset-2">GitHub</a>
+          </div>
         </div>
 
         <audio id="audioEl" preload="auto" src="dialup.mp3" class="hidden"></audio>
