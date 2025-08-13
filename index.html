@@ -97,15 +97,11 @@
                 </button>
               </div>
 
-              <div class="flex items-center justify-center w-full sm:w-auto order-1">
+              <div class="flex items-center justify-center w-full sm:w-auto order-1 gap-2 sm:gap-3">
                 <button id="playBtn" aria-label="Play or pause"
                   class="px-5 py-2.5 sm:px-6 sm:py-3 rounded-full bg-emerald-600 hover:bg-emerald-500 text-white text-base font-medium">
                   Play
                 </button>
-              </div>
-
-              <div class="flex items-center gap-2 sm:gap-3 w-full sm:w-auto order-3 justify-center sm:justify-end">
-                <input id="fileInput" type="file" accept="audio/*" class="sr-only" />
                 <label for="fileInput"
                   class="px-3 py-2 sm:px-4 sm:py-2.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-white text-sm cursor-pointer select-none">
                   Load Audio
@@ -114,6 +110,14 @@
                   class="px-3 py-2 sm:px-4 sm:py-2.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-sm">
                   Record Audio
                 </button>
+                <button id="trimBtn" aria-label="Trim spectrogram" disabled
+                  class="px-3 py-2 sm:px-4 sm:py-2.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-white text-sm opacity-40 cursor-not-allowed">
+                  Trim
+                </button>
+              </div>
+
+              <div class="flex items-center gap-2 sm:gap-3 w-full sm:w-auto order-3 justify-center sm:justify-end">
+                <input id="fileInput" type="file" accept="audio/*" class="sr-only" />
                 <button id="exportBtn" disabled aria-label="Export OBJ"
                   class="px-3 py-2 sm:px-4 sm:py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm">
                   Export OBJ

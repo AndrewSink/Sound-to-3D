@@ -11,6 +11,7 @@ const fileInput = document.getElementById('fileInput');
 const exportBtn = document.getElementById('exportBtn');
 const audioEl = document.getElementById('audioEl');
 const recordBtn = document.getElementById('recordBtn');
+const trimBtn = document.getElementById('trimBtn');
 
 // -------- Audio setup --------
 const audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -38,6 +39,8 @@ const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(container.clientWidth, container.clientHeight);
 renderer.setClearColor(0x000000, 1);
+// Enable local clipping so we can preview trims with planes
+renderer.localClippingEnabled = true;
 container.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -114,14 +117,328 @@ const material = new THREE.MeshLambertMaterial({
 const surface = new THREE.Mesh(geometry, material);
 surface.position.x = 0; // center over ground grid
 scene.add(surface);
-// Hide empty surface so the reference grid is visible until audio starts
+// Hide the legacy deformable surface; we'll render per-slice modules instead
 surface.visible = false;
 
-// -------- Reference grid (replaces flat grey plane) --------
+// Enable per-slice geometry generation (append-only modules each frame)
+const USE_PER_SLICE_GEOMETRY = true;
+
+// Group to hold per-slice modules (top strip + helper geometry spans)
+const slicesGroup = new THREE.Group();
+scene.add(slicesGroup);
+let sliceModules = [];
+let lastSliceAmps = new Float32Array(pointsPerSlice); // initialized to zeros
+
+function clearSliceModules() {
+  while (slicesGroup.children.length) {
+    const child = slicesGroup.children.pop();
+    if (child.geometry) child.geometry.dispose();
+    if (child.material && child.material.dispose && child.material !== wallsMaterial && child.material !== material) {
+      child.material.dispose();
+    }
+  }
+  sliceModules = [];
+  lastSliceAmps = new Float32Array(pointsPerSlice);
+}
+
+function appendSliceModule(prevAmps, currAmps) {
+  const index = sliceModules.length; // 0-based module index
+  const xPrev = worldLeftOffsetX + index * sliceSpacing;
+  const xCurr = xPrev + sliceSpacing;
+
+  // Top strip between prev and current across Z (quad strip)
+  const topPositions = new Float32Array((pointsPerSlice * 2) * 3);
+  const topColors = new Float32Array((pointsPerSlice * 2) * 3);
+  const topIndices = new Uint32Array((pointsPerSlice - 1) * 6);
+  for (let z = 0; z < pointsPerSlice; z++) {
+    const zWorld = zRowPositions[z];
+    const yPrev = prevAmps[z] * depth * heightScale;
+    const yCurr = currAmps[z] * depth * heightScale;
+    const v0 = z * 2;     // (xPrev, yPrev)
+    const v1 = v0 + 1;    // (xCurr, yCurr)
+    // v0
+    topPositions[3 * v0 + 0] = xPrev;
+    topPositions[3 * v0 + 1] = yPrev;
+    topPositions[3 * v0 + 2] = zWorld;
+    const c0 = referenceColorRamp(prevAmps[z]);
+    topColors[3 * v0 + 0] = c0.r; topColors[3 * v0 + 1] = c0.g; topColors[3 * v0 + 2] = c0.b;
+    // v1
+    topPositions[3 * v1 + 0] = xCurr;
+    topPositions[3 * v1 + 1] = yCurr;
+    topPositions[3 * v1 + 2] = zWorld;
+    const c1 = referenceColorRamp(currAmps[z]);
+    topColors[3 * v1 + 0] = c1.r; topColors[3 * v1 + 1] = c1.g; topColors[3 * v1 + 2] = c1.b;
+  }
+  let ti = 0;
+  for (let z = 0; z < pointsPerSlice - 1; z++) {
+    const a = z * 2;     // prev(z)
+    const b = a + 1;     // curr(z)
+    const c = a + 2;     // prev(z+1)
+    const d = c + 1;     // curr(z+1)
+    // triangles: a,b,d and a,d,c
+    topIndices[ti++] = a; topIndices[ti++] = b; topIndices[ti++] = d;
+    topIndices[ti++] = a; topIndices[ti++] = d; topIndices[ti++] = c;
+  }
+  const topGeo = new THREE.BufferGeometry();
+  topGeo.setAttribute('position', new THREE.BufferAttribute(topPositions, 3));
+  topGeo.setAttribute('color', new THREE.BufferAttribute(topColors, 3));
+  topGeo.setIndex(new THREE.BufferAttribute(topIndices, 1));
+  topGeo.computeVertexNormals();
+  const topMat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+  const topMesh = new THREE.Mesh(topGeo, topMat);
+  slicesGroup.add(topMesh);
+
+  // Helper geometry per slice
+  const helper = [];
+  // Base span plane
+  {
+    const baseGeo = new THREE.PlaneGeometry(sliceSpacing, depth, 1, 1);
+    baseGeo.rotateX(-Math.PI / 2);
+    baseGeo.translate((xPrev + xCurr) / 2, -baseThickness, 0);
+    const mesh = new THREE.Mesh(baseGeo, wallsMaterial);
+    slicesGroup.add(mesh); helper.push(mesh);
+  }
+  // Right wall at xCurr
+  {
+    const vcount = pointsPerSlice * 2;
+    const positions = new Float32Array(vcount * 3);
+    const indices = new Uint32Array((pointsPerSlice - 1) * 6);
+    for (let z = 0; z < pointsPerSlice; z++) {
+      const zW = zRowPositions[z];
+      const yTop = currAmps[z] * depth * heightScale;
+      const it = z * 2;
+      const ib = it + 1;
+      positions[3 * it + 0] = xCurr; positions[3 * it + 1] = yTop; positions[3 * it + 2] = zW;
+      positions[3 * ib + 0] = xCurr; positions[3 * ib + 1] = -baseThickness; positions[3 * ib + 2] = zW;
+    }
+    let pi = 0;
+    for (let z = 0; z < pointsPerSlice - 1; z++) {
+      const a = z * 2, b = a + 2, c = a + 1, d = b + 1;
+      indices[pi++] = a; indices[pi++] = c; indices[pi++] = d;
+      indices[pi++] = a; indices[pi++] = d; indices[pi++] = b;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setIndex(new THREE.BufferAttribute(indices, 1));
+    geo.computeVertexNormals();
+    const mesh = new THREE.Mesh(geo, wallsMaterial);
+    slicesGroup.add(mesh); helper.push(mesh);
+  }
+  // Back span (z = zMin) across xPrev..xCurr using row 0
+  {
+    const yPrev = prevAmps[0] * depth * heightScale;
+    const yCurr = currAmps[0] * depth * heightScale;
+    const geo = new THREE.BufferGeometry();
+    const posArr = new Float32Array(4 * 3);
+    const idxArr = new Uint16Array([0, 1, 3, 0, 3, 2]);
+    posArr.set([xPrev, yPrev, zMin, xCurr, yCurr, zMin, xPrev, -baseThickness, zMin, xCurr, -baseThickness, zMin]);
+    geo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+    geo.setIndex(new THREE.BufferAttribute(idxArr, 1));
+    geo.computeVertexNormals();
+    const mesh = new THREE.Mesh(geo, wallsMaterial);
+    slicesGroup.add(mesh); helper.push(mesh);
+  }
+  // Front span (z = zMax) across xPrev..xCurr using last row
+  {
+    const yPrev = prevAmps[pointsPerSlice - 1] * depth * heightScale;
+    const yCurr = currAmps[pointsPerSlice - 1] * depth * heightScale;
+    const geo = new THREE.BufferGeometry();
+    const posArr = new Float32Array(4 * 3);
+    const idxArr = new Uint16Array([0, 1, 3, 0, 3, 2]);
+    posArr.set([xPrev, yPrev, zMax, xCurr, yCurr, zMax, xPrev, -baseThickness, zMax, xCurr, -baseThickness, zMax]);
+    geo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+    geo.setIndex(new THREE.BufferAttribute(idxArr, 1));
+    geo.computeVertexNormals();
+    const mesh = new THREE.Mesh(geo, wallsMaterial);
+    slicesGroup.add(mesh); helper.push(mesh);
+  }
+  sliceModules.push({ topMesh, helper });
+}
+
+// Limit drawing of the deformable surface to only the filled region
+function updateSurfaceDrawRange() {
+  if (!geometry || !geometry.index) return;
+  const segmentsX = capacity - 1;
+  const segmentsZ = pointsPerSlice - 1;
+  const filledCols = getFilledColumns();
+  const filledSegX = Math.max(0, Math.min(segmentsX, filledCols - 1));
+  const triangles = filledSegX * segmentsZ * 2;
+  const indicesCount = triangles * 3;
+  geometry.setDrawRange(0, indicesCount);
+}
+
+// -------- Real-time watertight extrusions (base + 4 walls) --------
+const extrusionsGroup = new THREE.Group();
+scene.add(extrusionsGroup);
+let baseMesh = null;
+let backWallMesh = null;
+let frontWallMesh = null;
+let leftWallMesh = null;
+let rightWallMesh = null;
+const wallsMaterial = new THREE.MeshLambertMaterial({ color: 0xb3b3b3, side: THREE.DoubleSide, toneMapped: false });
+// Ensure all mesh materials render double-sided to avoid culling artifacts
+material.side = THREE.DoubleSide;
+wallsMaterial.side = THREE.DoubleSide;
+const topStripMaterial = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, toneMapped: false });
+
+let unifiedMesh = null; // single watertight mesh built at finalize
+
+function clearUnifiedMesh() {
+  if (unifiedMesh) {
+    if (unifiedMesh.geometry) unifiedMesh.geometry.dispose();
+    if (unifiedMesh.material) {
+      const mats = Array.isArray(unifiedMesh.material) ? unifiedMesh.material : [unifiedMesh.material];
+      for (const m of mats) m.dispose && m.dispose();
+    }
+    scene.remove(unifiedMesh);
+    unifiedMesh = null;
+  }
+}
+
+function clearExtrusions() {
+  while (extrusionsGroup.children.length) {
+    const m = extrusionsGroup.children.pop();
+    if (m.geometry) m.geometry.dispose();
+    if (m.material && m.material !== wallsMaterial) m.material.dispose && m.material.dispose();
+  }
+  baseMesh = backWallMesh = frontWallMesh = leftWallMesh = rightWallMesh = null;
+}
+
+function getFilledColumns() {
+  // Number of populated time columns (slices) on screen
+  const filledByStream = currentSliceIndex; // columns written into the geometry during playback
+  const filledByFinalize = capturedSlices.length > 0 ? capturedSlices.length : 0; // after finalize/trim
+  const filled = Math.max(filledByStream, filledByFinalize);
+  return Math.max(0, filled);
+}
+
+function ensureExtrusionMeshes() {
+  if (!baseMesh) {
+    baseMesh = new THREE.Mesh(new THREE.BufferGeometry(), wallsMaterial);
+    extrusionsGroup.add(baseMesh);
+  }
+  if (!backWallMesh) {
+    backWallMesh = new THREE.Mesh(new THREE.BufferGeometry(), wallsMaterial);
+    extrusionsGroup.add(backWallMesh);
+  }
+  if (!frontWallMesh) {
+    frontWallMesh = new THREE.Mesh(new THREE.BufferGeometry(), wallsMaterial);
+    extrusionsGroup.add(frontWallMesh);
+  }
+  if (!leftWallMesh) {
+    leftWallMesh = new THREE.Mesh(new THREE.BufferGeometry(), wallsMaterial);
+    extrusionsGroup.add(leftWallMesh);
+  }
+  if (!rightWallMesh) {
+    rightWallMesh = new THREE.Mesh(new THREE.BufferGeometry(), wallsMaterial);
+    extrusionsGroup.add(rightWallMesh);
+  }
+}
+
+function updateExtrusionsRealtime() {
+  const filledCols = getFilledColumns();
+  if (filledCols < 2) { clearExtrusions(); return; }
+  ensureExtrusionMeshes();
+  const pos = geometry.attributes.position;
+  const leftX = worldLeftOffsetX;
+  const width = (filledCols - 1) * sliceSpacing;
+
+  // Base slab: simple plane at y = -baseThickness
+  {
+    const bx = leftX + width / 2;
+    const by = -baseThickness;
+    const bz = 0;
+    const geo = new THREE.PlaneGeometry(width, depth, 1, 1);
+    geo.rotateX(-Math.PI / 2);
+    geo.translate(bx, by, bz);
+    baseMesh.geometry.dispose();
+    baseMesh.geometry = geo;
+  }
+
+  // Helper to build a wall along X (z fixed)
+  function buildWallAlongX(targetMesh, rowZIndex, zValue) {
+    const vcount = (filledCols) * 2; // top+bottom per column
+    const positions = new Float32Array(vcount * 3);
+    const indices = new Uint32Array((filledCols - 1) * 6);
+    for (let x = 0; x < filledCols; x++) {
+      const worldX = leftX + x * sliceSpacing;
+      const yTop = pos.getY(rowZIndex * capacity + x);
+      const iTop = x * 2;
+      const iBot = iTop + 1;
+      positions[3 * iTop + 0] = worldX;
+      positions[3 * iTop + 1] = yTop;
+      positions[3 * iTop + 2] = zValue;
+      positions[3 * iBot + 0] = worldX;
+      positions[3 * iBot + 1] = -baseThickness;
+      positions[3 * iBot + 2] = zValue;
+    }
+    let idx = 0;
+    for (let x = 0; x < filledCols - 1; x++) {
+      const a = x * 2;      // top(x)
+      const b = a + 2;      // top(x+1)
+      const c = a + 1;      // bot(x)
+      const d = b + 1;      // bot(x+1)
+      indices[idx++] = a; indices[idx++] = c; indices[idx++] = d;
+      indices[idx++] = a; indices[idx++] = d; indices[idx++] = b;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setIndex(new THREE.BufferAttribute(indices, 1));
+    geo.computeVertexNormals();
+    if (targetMesh.geometry) targetMesh.geometry.dispose();
+    targetMesh.geometry = geo;
+  }
+
+  // Helper to build a wall along Z (x fixed)
+  function buildWallAlongZ(targetMesh, colXIndex, xValue) {
+    const vcount = (pointsPerSlice) * 2; // per row top+bottom
+    const positions = new Float32Array(vcount * 3);
+    const indices = new Uint32Array((pointsPerSlice - 1) * 6);
+    for (let z = 0; z < pointsPerSlice; z++) {
+      const yTop = pos.getY(z * capacity + colXIndex);
+      const worldZ = zRowPositions[z];
+      const iTop = z * 2;
+      const iBot = iTop + 1;
+      positions[3 * iTop + 0] = xValue;
+      positions[3 * iTop + 1] = yTop;
+      positions[3 * iTop + 2] = worldZ;
+      positions[3 * iBot + 0] = xValue;
+      positions[3 * iBot + 1] = -baseThickness;
+      positions[3 * iBot + 2] = worldZ;
+    }
+    let idx = 0;
+    for (let z = 0; z < pointsPerSlice - 1; z++) {
+      const a = z * 2;
+      const b = a + 2;
+      const c = a + 1;
+      const d = b + 1;
+      indices[idx++] = a; indices[idx++] = d; indices[idx++] = c;
+      indices[idx++] = a; indices[idx++] = b; indices[idx++] = d;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setIndex(new THREE.BufferAttribute(indices, 1));
+    geo.computeVertexNormals();
+    if (targetMesh.geometry) targetMesh.geometry.dispose();
+    targetMesh.geometry = geo;
+  }
+
+  // Back/front walls
+  buildWallAlongX(backWallMesh, 0, zMin);
+  buildWallAlongX(frontWallMesh, pointsPerSlice - 1, zMax);
+  // Left/right walls using first and last available columns
+  buildWallAlongZ(leftWallMesh, 0, leftX);
+  buildWallAlongZ(rightWallMesh, Math.max(0, filledCols - 1), leftX + width);
+}
+
+// -------- Reference grid (optional) --------
+const GRID_ENABLED = false; // Turn off the grid entirely
 const gridGroup = new THREE.Group();
 scene.add(gridGroup);
+gridGroup.visible = GRID_ENABLED;
 
 function clearGrid() {
+  if (!GRID_ENABLED) return;
   while (gridGroup.children.length) {
     const child = gridGroup.children.pop();
     if (child.geometry) child.geometry.dispose();
@@ -129,12 +446,13 @@ function clearGrid() {
   }
 }
 
-function buildReferenceGrid(widthOverride, clipStartX = 0) {
+function buildReferenceGrid(widthOverride, clipStartX = 0, clipEndX = 0) {
+  if (!GRID_ENABLED) return;
   clearGrid();
   const widthWorld = (typeof widthOverride === 'number') ? widthOverride : sliceSpacing * (capacity - 1);
   const z0 = zMin;
   const z1 = zMax;
-  const y = -0.5; // push grid farther below to avoid any z-fighting
+  const y = 0.0; // coincide with spectrogram base plane (y=0)
 
   // Choose roughly even spacing that scales with size
   const xDiv = Math.max(6, Math.round(widthWorld / (sliceSpacing * 64)) * 8);
@@ -142,33 +460,235 @@ function buildReferenceGrid(widthOverride, clipStartX = 0) {
   const dx = widthWorld / xDiv;
   const dz = (z1 - z0) / zDiv;
   const startX = Math.max(0, Math.min(widthWorld, clipStartX));
+  const endX = Math.max(0, Math.min(widthWorld, clipEndX));
 
   const segments = [];
-  // Lines along X (vary Z)
-  for (let i = 0; i <= zDiv; i++) {
-    const z = z0 + dz * i;
-    segments.push(startX, y, z, widthWorld, y, z);
-  }
-  // Lines along Z (vary X)
-  for (let i = 0; i <= xDiv; i++) {
-    const x = dx * i;
-    if (x >= startX) {
-      segments.push(x, y, z0, x, y, z1);
+
+  function appendRange(xA, xB) {
+    const a = Math.max(0, Math.min(widthWorld, xA));
+    const b = Math.max(0, Math.min(widthWorld, xB));
+    if (b <= a) return;
+    // Lines along X (vary Z)
+    for (let i = 0; i <= zDiv; i++) {
+      const z = z0 + dz * i;
+      segments.push(a, y, z, b, y, z);
     }
+    // Lines along Z (vary X)
+    for (let i = 0; i <= xDiv; i++) {
+      const x = dx * i;
+      if (x >= a && x <= b) {
+        segments.push(x, y, z0, x, y, z1);
+      }
+    }
+  }
+
+  if (clipEndX > 0 && endX > startX) {
+    // Two visible regions: [0, startX] and [endX, width]
+    appendRange(0, startX);
+    appendRange(endX, widthWorld);
+  } else {
+    // Single visible region: [startX, width]
+    appendRange(startX, widthWorld);
   }
 
   const pos = new Float32Array(segments);
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   const mat = new THREE.LineBasicMaterial({ color: 0x3f3f46 });
-  // Keep grid color constant and allow strict occlusion
+  // Keep grid color constant and draw independent of depth (we clip under the model)
   mat.depthTest = true;
-  mat.depthWrite = false;
+  mat.depthWrite = true;
   mat.toneMapped = false;
   mat.transparent = false;
   const lines = new THREE.LineSegments(geo, mat);
   gridGroup.add(lines);
 }
+
+// -------- Trim handles and clipping --------
+let trimActive = false;
+let trimStartX = 0;
+let trimEndX = 0;
+// Tracks the world-space X where the current spectrogram geometry starts
+let worldLeftOffsetX = 0;
+const trimGroup = new THREE.Group();
+scene.add(trimGroup);
+
+// Use total frequency span; avoids referencing zMin/zMax before init
+const handleDepth = () => depth + 0.5;
+const amplitudeMaxYRef = () => depth * heightScale;
+
+function createTrimHandle(color) {
+  const geo = new THREE.BoxGeometry(0.6, amplitudeMaxYRef() + 2, handleDepth());
+  const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.95 });
+  // Ensure trim handles never occlude the grid or spectrogram visuals while dragging
+  mat.depthTest = false;
+  mat.depthWrite = false;
+  mat.toneMapped = false;
+  mat.side = THREE.DoubleSide;
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.y = (amplitudeMaxYRef()) / 2;
+  mesh.renderOrder = 3;
+  mesh.userData.isTrimHandle = true;
+  // Store base/hover colors for quick visual feedback on hover
+  mesh.userData.baseColor = new THREE.Color(color);
+  mesh.userData.hoverColor = mesh.userData.baseColor.clone().multiplyScalar(0.8);
+  return mesh;
+}
+
+const leftHandle = createTrimHandle(0x22d3ee); // cyan
+const rightHandle = createTrimHandle(0xf43f5e); // rose
+trimGroup.add(leftHandle);
+trimGroup.add(rightHandle);
+trimGroup.visible = false;
+
+const leftClip = new THREE.Plane(new THREE.Vector3(1, 0, 0), 0);
+const rightClip = new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0);
+
+function getCurrentMaxX() {
+  const slices = Math.max(currentSliceIndex, capturedSlices.length);
+  return Math.max(0, (Math.max(2, slices) - 1) * sliceSpacing);
+}
+
+function setTrimRange(startX, endX) {
+  const maxX = getCurrentMaxX();
+  trimStartX = Math.max(0, Math.min(startX, maxX - sliceSpacing));
+  trimEndX = Math.max(trimStartX + sliceSpacing, Math.min(endX, maxX));
+  // Update handles
+  leftHandle.position.x = trimStartX;
+  rightHandle.position.x = trimEndX;
+  // Update clipping planes (keep between start and end)
+  leftClip.constant = -trimStartX; // keep x >= start
+  rightClip.constant = trimEndX;   // with normal (-1,0,0): keep x <= end
+  material.clippingPlanes = trimActive ? [leftClip, rightClip] : [];
+  // Keep the grid visible while trimming by extending and clipping ahead of the active range
+  const gridTotalWidth = Math.max(sliceSpacing * (capacity - 1), maxX + sliceSpacing * 100);
+  // Draw grid on both sides of the active window while trimming
+  buildReferenceGrid(gridTotalWidth, trimStartX - 0.5 * sliceSpacing, trimEndX + 0.5 * sliceSpacing);
+}
+
+function enableTrimMode(enable) {
+  trimActive = enable;
+  trimGroup.visible = enable;
+  if (enable) {
+    // Pause playback and gray out all controls except Reset and Done (Trim)
+    try { if (!audioEl.paused) audioEl.pause(); } catch { }
+    isCapturing = false;
+    setPlayButtonState(false);
+    setControlsForTrimMode(true);
+    const widthX = getCurrentMaxX();
+    // Initialize handles to the current geometry extents in world space
+    const leftX = Math.max(0, worldLeftOffsetX);
+    setTrimRange(leftX, leftX + Math.max(sliceSpacing, widthX));
+  } else {
+    material.clippingPlanes = [];
+    // Re-enable controls after trimming
+    setControlsForTrimMode(false);
+  }
+}
+
+function applyTrimPermanent() {
+  // Ensure we have slice data; if not, synthesize from current geometry
+  if (capturedSlices.length < 2) {
+    synthesizeCapturedFromSurface();
+  }
+  const total = capturedSlices.length;
+  if (total < 2) {
+    // Nothing to trim
+    enableTrimMode(false);
+    return;
+  }
+  const startSlice = Math.max(0, Math.floor(trimStartX / sliceSpacing));
+  const endSlice = Math.max(startSlice + 1, Math.min(total - 1, Math.ceil(trimEndX / sliceSpacing)));
+  const trimmed = capturedSlices.slice(startSlice, endSlice + 1);
+  capturedSlices.length = 0;
+  for (const s of trimmed) capturedSlices.push(s);
+  // Rebuild the geometry to the trimmed range
+  isCapturing = false;
+  hasEnded = true;
+  // Preserve original world X by keeping left edge at original start position
+  const leftOffsetX = trimStartX;
+  finalizeModelGeometry(leftOffsetX);
+  worldLeftOffsetX = leftOffsetX;
+  frameWholeModel();
+  enableTrimMode(false);
+  setTrimAvailability(true);
+  setExportAvailability(true);
+}
+
+// Dragging logic
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+const dragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0); // y=0
+let draggingHandle = null; // 'left' | 'right' | null
+let hoverHandle = null; // current handle under the pointer
+
+function setHandleHover(handle, isHover) {
+  if (!handle || !handle.material) return;
+  const target = isHover ? handle.userData.hoverColor : handle.userData.baseColor;
+  handle.material.color.copy(target);
+  handle.material.needsUpdate = true;
+}
+
+function updateHoverFromPointer(evt) {
+  if (!trimActive || draggingHandle) return; // no hover while dragging or when trim off
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  let newHover = null;
+  const hits = raycaster.intersectObjects([leftHandle, rightHandle], false);
+  if (hits && hits.length) newHover = hits[0].object;
+  if (hoverHandle !== newHover) {
+    setHandleHover(leftHandle, newHover === leftHandle);
+    setHandleHover(rightHandle, newHover === rightHandle);
+    // Do not change the cursor; only use color to signal interactivity
+    hoverHandle = newHover;
+  }
+}
+
+function onPointerMove(evt) {
+  if (!draggingHandle) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hit = new THREE.Vector3();
+  if (raycaster.ray.intersectPlane(dragPlane, hit)) {
+    if (draggingHandle === 'left') {
+      setTrimRange(hit.x, trimEndX);
+    } else if (draggingHandle === 'right') {
+      setTrimRange(trimStartX, hit.x);
+    }
+  }
+}
+
+function onPointerDown(evt) {
+  if (!trimActive) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hits = raycaster.intersectObjects([leftHandle, rightHandle], false);
+  if (hits && hits.length) {
+    const obj = hits[0].object;
+    draggingHandle = (obj === leftHandle) ? 'left' : 'right';
+    controls.enabled = false;
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp, { once: true });
+    // No cursor change on drag start
+  }
+}
+
+function onPointerUp() {
+  window.removeEventListener('pointermove', onPointerMove);
+  draggingHandle = null;
+  controls.enabled = true;
+  // Restore default cursor
+  renderer.domElement.style.cursor = 'auto';
+}
+
+renderer.domElement.addEventListener('pointerdown', onPointerDown);
+renderer.domElement.addEventListener('pointermove', updateHoverFromPointer);
 
 // Removed helper ground grid
 
@@ -301,16 +821,16 @@ function updateSurfaceFromFrequencies() {
   positionAttr.needsUpdate = true;
   geometry.attributes.color.needsUpdate = true;
 
-  // Clip the grid under the generated portion of the model so no lines show through
-  const generatedWidth = Math.max(0, (currentSliceIndex - 1) * sliceSpacing);
-  buildReferenceGrid(sliceSpacing * (capacity - 1), generatedWidth + 0.5 * sliceSpacing);
-  // Ensure constant grid brightness regardless of scene state
-  gridGroup.traverse((obj) => {
-    if (obj.material && obj.material.isLineBasicMaterial) {
-      obj.material.toneMapped = false;
-      obj.material.needsUpdate = true;
-    }
-  });
+  // Per-slice path: append module instead of relying on deformable surface
+  if (USE_PER_SLICE_GEOMETRY) {
+    appendSliceModule(lastSliceAmps, newSlice);
+    lastSliceAmps = newSlice;
+  } else {
+    // Update watertight extrusions in real time (legacy path)
+    updateExtrusionsRealtime();
+    // Only draw indices for the filled region so the remainder stays invisible
+    updateSurfaceDrawRange();
+  }
 }
 
 // Color ramp designed to match the reference look:
@@ -512,7 +1032,9 @@ buildAxesAndTicks();
 // backed up and slightly orbiting to the right similar to the reference angle.
 function positionCameraOverview() {
   // Straight-on view, grid framed slightly higher on screen
-  const targetX = sliceSpacing * 120;
+  // Nudge left on small/mobile screens so axes are in frame on load
+  const isMobileNarrow = Math.min(window.innerWidth || 0, document.documentElement.clientWidth || 0) <= 640;
+  const targetX = isMobileNarrow ? sliceSpacing * 45 : sliceSpacing * 120;
   const targetY = depth * heightScale * .2; // slightly higher center so grid sits more centered
   const targetZ = 0;
   controls.target.set(targetX, targetY, targetZ);
@@ -611,6 +1133,19 @@ function setExportAvailability(enabled) {
   exportBtn.disabled = !enabled;
 }
 
+function setTrimAvailability(enabled) {
+  if (!trimBtn) return;
+  trimBtn.disabled = !enabled;
+  if (enabled) {
+    trimBtn.classList.remove('opacity-40', 'cursor-not-allowed');
+  } else {
+    trimBtn.classList.add('opacity-40', 'cursor-not-allowed');
+    // Ensure we exit trim mode if it was on
+    if (trimActive) enableTrimMode(false);
+    trimBtn.textContent = 'Trim';
+  }
+}
+
 function setRecordButtonState(isRec) {
   if (!recordBtn) return;
   if (isRec) {
@@ -621,6 +1156,68 @@ function setRecordButtonState(isRec) {
     recordBtn.textContent = 'Record Audio';
     recordBtn.classList.remove('bg-yellow-500', 'hover:bg-yellow-400');
     recordBtn.classList.add('bg-rose-600', 'hover:bg-rose-500');
+  }
+}
+
+function setPlayAvailability(enabled) {
+  if (!playBtn) return;
+  playBtn.disabled = !enabled;
+  if (enabled) {
+    playBtn.classList.remove('opacity-40', 'cursor-not-allowed');
+  } else {
+    playBtn.classList.add('opacity-40', 'cursor-not-allowed');
+  }
+}
+
+function setRecordAvailability(enabled) {
+  if (!recordBtn) return;
+  recordBtn.disabled = !enabled;
+  if (enabled) {
+    recordBtn.classList.remove('opacity-40', 'cursor-not-allowed');
+  } else {
+    recordBtn.classList.add('opacity-40', 'cursor-not-allowed');
+  }
+}
+
+function setControlsForTrimMode(active) {
+  // Disable everything except Reset and Trim (which shows 'Done' while active)
+  const toToggle = [playBtn, recordBtn, exportBtn, toggleAxesBtn, fileInput];
+  for (const el of toToggle) {
+    if (!el) continue;
+    el.disabled = !!active;
+  }
+  // Visual feedback for buttons
+  const toStyle = [playBtn, recordBtn, exportBtn, toggleAxesBtn];
+  for (const el of toStyle) {
+    if (!el) continue;
+    if (active) el.classList.add('opacity-40', 'cursor-not-allowed');
+    else el.classList.remove('opacity-40', 'cursor-not-allowed');
+  }
+  // File input label styling
+  const fileLabel = document.querySelector('label[for="fileInput"]');
+  if (fileLabel) {
+    if (active) fileLabel.classList.add('opacity-40', 'cursor-not-allowed', 'pointer-events-none');
+    else fileLabel.classList.remove('opacity-40', 'cursor-not-allowed', 'pointer-events-none');
+  }
+}
+
+// Disable specific controls while recording: Play, Load Audio, Hide Axes, Reset
+function setControlsForRecording(active) {
+  const toToggle = [playBtn, toggleAxesBtn, resetBtn, fileInput];
+  for (const el of toToggle) {
+    if (!el) continue;
+    el.disabled = !!active;
+  }
+  const toStyle = [playBtn, toggleAxesBtn, resetBtn];
+  for (const el of toStyle) {
+    if (!el) continue;
+    if (active) el.classList.add('opacity-40', 'cursor-not-allowed');
+    else el.classList.remove('opacity-40', 'cursor-not-allowed');
+  }
+  const fileLabel = document.querySelector('label[for="fileInput"]');
+  if (fileLabel) {
+    if (active) fileLabel.classList.add('opacity-40', 'cursor-not-allowed', 'pointer-events-none');
+    else fileLabel.classList.remove('opacity-40', 'cursor-not-allowed', 'pointer-events-none');
   }
 }
 
@@ -643,6 +1240,8 @@ async function startRecording() {
     hardResetVisualization();
     flushAnalyser();
     setExportAvailability(false);
+    setControlsForRecording(true);
+    setTrimAvailability(false);
 
     // Recorder for saving to an audio file
     recordedChunks = [];
@@ -665,10 +1264,17 @@ async function startRecording() {
       isCapturing = false;
       isRecording = false;
       disconnectMic();
+      // Ensure we have slice data even for very short recordings
+      if (capturedSlices.length < 2) synthesizeCapturedFromSurface();
       finalizeModelGeometry();
+      // Make helper geometry visible and updated
+      surface.visible = true;
+      updateExtrusionsRealtime();
       frameWholeModel();
       setRecordButtonState(false);
       setExportAvailability(true);
+      setTrimAvailability(true);
+      setControlsForRecording(false);
     };
     mediaRecorder.start();
 
@@ -708,18 +1314,28 @@ function disconnectMic() {
 }
 
 playBtn.addEventListener('click', async () => {
-  if (isRecording) return; // ignore play while recording to avoid mixing mic + file
-  if (audioEl.paused) {
-    if (audioContext.state === 'suspended') await audioContext.resume();
-    try { await audioEl.play(); } catch (e) { /* ignore */ }
-    isCapturing = true;
-    setPlayButtonState(true);
-  } else {
+  if (isRecording) return; // ignore play while recording
+
+  if (!audioEl.paused) {
+    // Currently playing → Pause without resetting
     audioEl.pause();
     isCapturing = false;
     setPlayButtonState(false);
-    // keep export availability as-is
+    return;
   }
+
+  // From a paused/stopped state, start from the beginning and clear the viz
+  try { audioEl.currentTime = 0; audioEl.load(); } catch { }
+  hasEnded = false;
+  isCapturing = false;
+  capturedSlices.length = 0;
+  hardResetVisualization();
+  // Clear analyser state so the first slice doesn't contain previous data
+  flushAnalyser();
+  if (audioContext.state === 'suspended') await audioContext.resume();
+  try { await audioEl.play(); } catch (e) { /* ignore */ }
+  isCapturing = true;
+  setPlayButtonState(true);
 });
 
 resetBtn.addEventListener('click', () => {
@@ -736,6 +1352,11 @@ resetBtn.addEventListener('click', () => {
   capturedSlices.length = 0;
   hardResetVisualization();
   setExportAvailability(false);
+  setTrimAvailability(false);
+  // Exit trim mode if active and restore control availability
+  if (trimActive) enableTrimMode(false);
+  // After reset, ensure no recording-specific disables remain
+  setControlsForRecording(false);
 });
 
 fileInput.addEventListener('change', async (e) => {
@@ -755,6 +1376,7 @@ fileInput.addEventListener('change', async (e) => {
   audioEl.play();
   isCapturing = true;
   setExportAvailability(false);
+  setTrimAvailability(false);
 });
 
 // Drag & drop support
@@ -776,6 +1398,7 @@ window.addEventListener('drop', (e) => {
   audioEl.play();
   isCapturing = true;
   setExportAvailability(false);
+  setTrimAvailability(false);
 });
 
 // Auto-start visualization when audio starts
@@ -784,6 +1407,7 @@ audioEl.addEventListener('play', () => {
   setPlayButtonState(true);
   // Enable export once at least one slice lands
   setExportAvailability(true);
+  setTrimAvailability(true);
 });
 
 audioEl.addEventListener('ended', () => {
@@ -793,6 +1417,8 @@ audioEl.addEventListener('ended', () => {
   // back the camera up a bit so the entire model is in view
   frameWholeModel();
   setPlayButtonState(false);
+  // Allow trimming finalized model
+  setTrimAvailability(true);
 });
 
 exportBtn.addEventListener('click', () => {
@@ -816,43 +1442,161 @@ if (recordBtn) {
   });
 }
 
+if (trimBtn) {
+  trimBtn.addEventListener('click', () => {
+    if (!trimActive) {
+      enableTrimMode(true);
+      trimBtn.textContent = 'Done';
+    } else {
+      // Commit the trim and exit
+      applyTrimPermanent();
+      trimBtn.textContent = 'Trim';
+    }
+  });
+}
+
 // Rebuild the surface geometry to display the full captured model when playback finishes
-function finalizeModelGeometry() {
+function finalizeModelGeometry(leftOffsetX = 0) {
   const slices = capturedSlices.length;
   if (slices < 2) return;
   const finalWidth = sliceSpacing * (slices - 1);
-  const newGeo = new THREE.PlaneGeometry(finalWidth, depth, slices - 1, pointsPerSlice - 1);
-  newGeo.rotateX(-Math.PI / 2);
-  // Anchor left edge at x=0 so the model does not shift on completion
-  newGeo.translate(finalWidth / 2, 0, 0);
 
-  const pos = newGeo.attributes.position;
-  const col = new Float32Array(pos.count * 3);
-  newGeo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  // Remove legacy/preview content
+  clearExtrusions();
+  clearUnifiedMesh();
+  clearSliceModules();
 
-  const z0 = -depth / 2;
-  const dz = depth / (pointsPerSlice - 1);
-  // Fill Y and color from captured data
-  for (let z = 0; z < pointsPerSlice; z++) {
-    for (let x = 0; x < slices; x++) {
-      const idx = z * slices + x;
-      const amp = capturedSlices[x][z];
+  // Build unified watertight geometry buffers
+  // We will assemble: top surface (colored) + base slab + back/front + left/right walls
+  const activeRowsCount = Math.max(2, Math.floor(pointsPerSlice * activeFrequencyFraction));
+  const bins = activeRowsCount + 1; // include front boundary
+  const dx = sliceSpacing;
+  const x0 = leftOffsetX;
+
+  // Estimate counts conservatively
+  const vTop = slices * bins;
+  const vBottom = slices * bins;
+  const vWallsApprox = slices * 2 * 4 + bins * 2 * 2; // rough
+  const maxVertices = (vTop + vBottom + vWallsApprox) * 2; // safety margin
+
+  const positions = [];
+  const colorsArr = [];
+  const indices = [];
+  const groups = []; // { start, count, materialIndex }
+  const MATERIAL_TOP = 0; // colored
+  const MATERIAL_BASE = 1; // gray helper
+
+  function pushVertex(x, y, z, c) {
+    positions.push(x, y, z);
+    if (c) colorsArr.push(c.r, c.g, c.b); else colorsArr.push(0.7, 0.7, 0.7);
+    return (positions.length / 3) - 1;
+  }
+
+  function addQuad(a, b, c, d, materialIndex) {
+    const start = indices.length;
+    // Two triangles: a,b,d and a,d,c
+    indices.push(a, b, d, a, d, c);
+    const count = indices.length - start;
+    groups.push({ start, count, materialIndex });
+  }
+
+  // Precompute Z per active row with same mapping as live view
+  const zAt = new Array(bins);
+  for (let j = 0; j < bins; j++) {
+    let z;
+    if (j < activeRowsCount) {
+      const t = j / (activeRowsCount - 1);
+      const tExp = Math.pow(t, frequencyExponent);
+      z = zMin + tExp * (zMax - zMin);
+    } else {
+      z = zMax;
+    }
+    zAt[j] = z;
+  }
+
+  // Build top surface
+  const vIndexTop = []; // [slices][bins]
+  for (let i = 0; i < slices; i++) {
+    vIndexTop[i] = new Array(bins);
+    const x = x0 + dx * i;
+    const slice = capturedSlices[i];
+    for (let j = 0; j < bins; j++) {
+      const z = zAt[j];
+      const amp = (j < activeRowsCount) ? slice[j] : 0;
       const y = amp * depth * heightScale;
-      pos.setY(idx, y);
-      const color = referenceColorRamp(amp);
-      const cIdx = idx * 3;
-      col[cIdx + 0] = color.r;
-      col[cIdx + 1] = color.g;
-      col[cIdx + 2] = color.b;
+      const c = referenceColorRamp(amp);
+      vIndexTop[i][j] = pushVertex(x, y, z, c);
     }
   }
-  pos.needsUpdate = true;
-  newGeo.attributes.color.needsUpdate = true;
-  surface.geometry.dispose();
-  geometry = newGeo;
-  surface.geometry = geometry;
-  // Update grid to final width
-  buildReferenceGrid(finalWidth, finalWidth + 0.5 * sliceSpacing);
+  // Bottom base grid vertices at y = -baseThickness
+  const vIndexBottom = [];
+  for (let i = 0; i < slices; i++) {
+    vIndexBottom[i] = new Array(bins);
+    const x = x0 + dx * i;
+    for (let j = 0; j < bins; j++) {
+      const z = zAt[j];
+      vIndexBottom[i][j] = pushVertex(x, -baseThickness, z, null);
+    }
+  }
+
+  // Top faces
+  for (let i = 0; i < slices - 1; i++) {
+    for (let j = 0; j < bins - 1; j++) {
+      const a = vIndexTop[i][j];
+      const b = vIndexTop[i + 1][j];
+      const c = vIndexTop[i + 1][j + 1];
+      const d = vIndexTop[i][j + 1];
+      addQuad(a, b, d, c, MATERIAL_TOP);
+    }
+  }
+  // Bottom faces (base slab top)
+  for (let i = 0; i < slices - 1; i++) {
+    for (let j = 0; j < bins - 1; j++) {
+      const a = vIndexBottom[i][j];
+      const b = vIndexBottom[i + 1][j];
+      const c = vIndexBottom[i + 1][j + 1];
+      const d = vIndexBottom[i][j + 1];
+      addQuad(a, b, d, c, MATERIAL_BASE);
+    }
+  }
+  // Back (z = zMin) and Front (z = zMax) walls
+  const jBack = 0;
+  const jFront = bins - 1;
+  for (let i = 0; i < slices - 1; i++) {
+    // Back
+    addQuad(vIndexTop[i][jBack], vIndexTop[i + 1][jBack], vIndexBottom[i][jBack], vIndexBottom[i + 1][jBack], MATERIAL_BASE);
+    // Front
+    addQuad(vIndexTop[i][jFront], vIndexTop[i + 1][jFront], vIndexBottom[i][jFront], vIndexBottom[i + 1][jFront], MATERIAL_BASE);
+  }
+  // Left and Right walls along Z
+  for (let j = 0; j < bins - 1; j++) {
+    // Left
+    addQuad(vIndexTop[0][j], vIndexTop[0][j + 1], vIndexBottom[0][j], vIndexBottom[0][j + 1], MATERIAL_BASE);
+    // Right
+    addQuad(vIndexTop[slices - 1][j], vIndexTop[slices - 1][j + 1], vIndexBottom[slices - 1][j], vIndexBottom[slices - 1][j + 1], MATERIAL_BASE);
+  }
+
+  // Build unified BufferGeometry
+  const posArr = new Float32Array(positions);
+  const colArr = new Float32Array(colorsArr);
+  const idxArr = (posArr.length / 3 > 65535) ? new Uint32Array(indices) : new Uint16Array(indices);
+  const unifiedGeo = new THREE.BufferGeometry();
+  unifiedGeo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+  unifiedGeo.setAttribute('color', new THREE.BufferAttribute(colArr, 3));
+  unifiedGeo.setIndex(new THREE.BufferAttribute(idxArr, 1));
+  unifiedGeo.computeVertexNormals();
+  // Define groups
+  unifiedGeo.clearGroups();
+  for (const g of groups) unifiedGeo.addGroup(g.start, g.count, g.materialIndex);
+
+  // Build mesh with groups: [colored top, gray base]
+  const materials = [topStripMaterial, wallsMaterial];
+  unifiedMesh = new THREE.Mesh(unifiedGeo, materials);
+  scene.add(unifiedMesh);
+
+  // Hide legacy pieces
+  surface.visible = false;
+  worldLeftOffsetX = leftOffsetX;
 }
 
 // If user exports before capture has enough slices, sample the on-screen geometry
@@ -875,7 +1619,15 @@ function synthesizeCapturedFromSurface() {
 
 // Build a watertight OBJ + MTL. Colors are assigned per-face via materials.
 function buildOBJFromCaptured() {
-  const slices = capturedSlices.length;
+  // Apply trim range to captured slices if trim is active
+  let slices = capturedSlices.length;
+  let startSlice = 0;
+  let endSlice = slices - 1;
+  if (trimActive && slices > 1) {
+    startSlice = Math.max(0, Math.floor(trimStartX / sliceSpacing));
+    endSlice = Math.max(startSlice + 1, Math.min(slices - 1, Math.ceil(trimEndX / sliceSpacing)));
+    slices = endSlice - startSlice + 1;
+  }
   const activeRowsCount = Math.max(2, Math.floor(pointsPerSlice * activeFrequencyFraction));
   // Use only the active frequency band plus one front boundary row to avoid degenerate cells
   const bins = activeRowsCount + 1;
@@ -942,7 +1694,7 @@ function buildOBJFromCaptured() {
   const flatEps = 0.02 * depth * heightScale;
   for (let i = 0; i < slices; i++) {
     const x = x0 + dx * i;
-    const slice = capturedSlices[i];
+    const slice = capturedSlices[startSlice + i];
     for (let j = 0; j < bins; j++) {
       // Use same nonlinear Z placement used in the live view
       let z;
@@ -962,22 +1714,32 @@ function buildOBJFromCaptured() {
     }
   }
 
-  // Bottom grid vertices at y = -baseThickness matching the top grid segmentation
-  // This guarantees shared edges with all side walls for a watertight mesh
-  const indexBottom = Array.from({ length: slices }, () => new Array(bins));
+  // Bottom boundary vertices only (no interior grid). We keep vertices along
+  // the 4 rectangle edges so walls can share edges and the base can be a single quad.
+  const bottomBack = new Array(slices);   // j = 0
+  const bottomFront = new Array(slices);  // j = bins-1
+  const bottomLeft = new Array(bins);     // i = 0
+  const bottomRight = new Array(bins);    // i = slices-1
+
+  const backZPlane = z0;           // equals zMin
+  const frontZPlane = z0 + depth;  // equals zMax
+
   for (let i = 0; i < slices; i++) {
     const x = x0 + dx * i;
-    for (let j = 0; j < bins; j++) {
-      let z;
-      if (j < activeRowsCount) {
-        const t = j / (activeRowsCount - 1);
-        const tExp = Math.pow(t, frequencyExponent);
-        z = z0 + tExp * depth;
-      } else {
-        z = z0 + depth;
-      }
-      indexBottom[i][j] = pushV(x, -baseThickness, z, baseColor.r, baseColor.g, baseColor.b);
+    bottomBack[i] = pushV(x, -baseThickness, backZPlane, baseColor.r, baseColor.g, baseColor.b);
+    bottomFront[i] = pushV(x, -baseThickness, frontZPlane, baseColor.r, baseColor.g, baseColor.b);
+  }
+  for (let j = 0; j < bins; j++) {
+    let z;
+    if (j < activeRowsCount) {
+      const t = j / (activeRowsCount - 1);
+      const tExp = Math.pow(t, frequencyExponent);
+      z = z0 + tExp * depth;
+    } else {
+      z = frontZPlane;
     }
+    bottomLeft[j] = pushV(x0, -baseThickness, z, baseColor.r, baseColor.g, baseColor.b);
+    bottomRight[j] = pushV(x0 + dx * (slices - 1), -baseThickness, z, baseColor.r, baseColor.g, baseColor.b);
   }
 
   // Removed rear slab and zero-height shelf to avoid overlapping/co-planar faces.
@@ -1051,25 +1813,21 @@ function buildOBJFromCaptured() {
     emitFace(a0, b1, b0, OUT_FRONT, baseMat);
   }
 
-  // Triangulate the bottom surface cell-by-cell to match the top grid
-  for (let i = 0; i < slices - 1; i++) {
-    for (let j = 0; j < bins - 1; j++) {
-      const a = indexBottom[i][j];
-      const b = indexBottom[i + 1][j];
-      const c = indexBottom[i + 1][j + 1];
-      const d = indexBottom[i][j + 1];
-      emitFace(a, b, c, OUT_BOTTOM, baseMat);
-      emitFace(a, c, d, OUT_BOTTOM, baseMat);
-    }
-  }
+  // Triangulate the bottom surface as a single quad using 4 corner vertices
+  const bl = bottomBack[0];
+  const br = bottomBack[slices - 1];
+  const fr = bottomFront[slices - 1];
+  const fl = bottomFront[0];
+  emitFace(bl, br, fr, OUT_BOTTOM, baseMat);
+  emitFace(bl, fr, fl, OUT_BOTTOM, baseMat);
 
   // Side walls: connect top borders to bottom grid
-  // Back edge z = z0 → vertical wall using bottom grid row j=0
+  // Back edge z = z0 → vertical wall using bottom boundary row j=0
   for (let i = 0; i < slices - 1; i++) {
     const aTop = indexTop[i][0];
     const bTop = indexTop[i + 1][0];
-    const aBot = indexBottom[i][0];
-    const bBot = indexBottom[i + 1][0];
+    const aBot = bottomBack[i];
+    const bBot = bottomBack[i + 1];
     // Consistent diagonal aTop -> bBot
     emitFace(aTop, aBot, bBot, OUT_BACK, baseMat);
     emitFace(aTop, bBot, bTop, OUT_BACK, baseMat);
@@ -1078,58 +1836,42 @@ function buildOBJFromCaptured() {
   // (emitted above), avoiding extra overlapping geometry.
 
   // Removed side faces for the deleted back shelf.
-  // Front edge z = z0 + depth → vertical wall using bottom grid row j=bins-1
+  // Front edge z = z0 + depth → vertical wall using bottom boundary row j=bins-1
   for (let i = 0; i < slices - 1; i++) {
     const aTop = indexTop[i][bins - 1];
     const bTop = indexTop[i + 1][bins - 1];
-    const aBot = indexBottom[i][bins - 1];
-    const bBot = indexBottom[i + 1][bins - 1];
+    const aBot = bottomFront[i];
+    const bBot = bottomFront[i + 1];
     // Consistent diagonal aTop -> bBot
     emitFace(aTop, aBot, bBot, OUT_FRONT, baseMat);
     emitFace(aTop, bBot, bTop, OUT_FRONT, baseMat);
   }
-  // Side walls (left and right) with per-row bottoms to avoid giant triangles
-  // Precompute side bottoms along Z
-  const sideBottomLeft = new Array(bins);
-  const sideBottomRight = new Array(bins);
-  const activeRows = bins - 1; // since we truncated to active band + boundary
-  for (let j = 0; j < bins; j++) {
-    let z;
-    if (j < activeRows) {
-      const t = j / (activeRows - 1);
-      const tExp = Math.pow(t, frequencyExponent);
-      z = z0 + tExp * depth;
-    } else {
-      z = z0 + depth;
-    }
-    sideBottomLeft[j] = indexBottom[0][j];
-    sideBottomRight[j] = indexBottom[slices - 1][j];
-  }
+  // Side walls (left and right) using boundary bottom edges
   // Left wall
   for (let j = 0; j < bins - 1; j++) {
     const aTop = indexTop[0][j];
     const bTop = indexTop[0][j + 1];
-    const aBot = sideBottomLeft[j];
-    const bBot = sideBottomLeft[j + 1];
+    const aBot = bottomLeft[j];
+    const bBot = bottomLeft[j + 1];
     // Consistent diagonal aTop -> bBot
     emitFace(aTop, aBot, bBot, OUT_LEFT, baseMat);
     emitFace(aTop, bBot, bTop, OUT_LEFT, baseMat);
   }
   // Ensure seam closed at top/bottom of left wall
-  emitFace(indexTop[0][bins - 2], indexTop[0][bins - 1], sideBottomLeft[bins - 1], OUT_LEFT, baseMat);
-  emitFace(indexTop[0][bins - 2], sideBottomLeft[bins - 1], sideBottomLeft[bins - 2], OUT_LEFT, baseMat);
+  emitFace(indexTop[0][bins - 2], indexTop[0][bins - 1], bottomLeft[bins - 1], OUT_LEFT, baseMat);
+  emitFace(indexTop[0][bins - 2], bottomLeft[bins - 1], bottomLeft[bins - 2], OUT_LEFT, baseMat);
   // Right wall
   for (let j = 0; j < bins - 1; j++) {
     const aTop = indexTop[slices - 1][j];
     const bTop = indexTop[slices - 1][j + 1];
-    const aBot = sideBottomRight[j];
-    const bBot = sideBottomRight[j + 1];
+    const aBot = bottomRight[j];
+    const bBot = bottomRight[j + 1];
     // Consistent diagonal aTop -> bBot
     emitFace(aTop, aBot, bBot, OUT_RIGHT, baseMat);
     emitFace(aTop, bBot, bTop, OUT_RIGHT, baseMat);
   }
-  emitFace(indexTop[slices - 1][bins - 2], sideBottomRight[bins - 2], indexTop[slices - 1][bins - 1], OUT_RIGHT, baseMat);
-  emitFace(indexTop[slices - 1][bins - 1], sideBottomRight[bins - 2], sideBottomRight[bins - 1], OUT_RIGHT, baseMat);
+  emitFace(indexTop[slices - 1][bins - 2], bottomRight[bins - 2], indexTop[slices - 1][bins - 1], OUT_RIGHT, baseMat);
+  emitFace(indexTop[slices - 1][bins - 1], bottomRight[bins - 2], bottomRight[bins - 1], OUT_RIGHT, baseMat);
 
   // No extra projection behind the rear plane; clipped at z0
 
@@ -1189,6 +1931,10 @@ function resetVisualization() {
   surface.visible = false;
   // Ensure grid renders below surface by resetting any modified order
   gridGroup.traverse((obj) => { obj.renderOrder = 0; });
+  // Remove any watertight extrusions created previously
+  clearExtrusions();
+  clearUnifiedMesh();
+  clearSliceModules();
 }
 
 // Full reset: re-create the surface to initial capacity and clear indices
@@ -1207,6 +1953,15 @@ function hardResetVisualization() {
   buildReferenceGrid(undefined, 0);
   // Optionally recenters the view near the beginning
   positionCameraOverview();
+  // Reset world-space offset when fully resetting the scene
+  worldLeftOffsetX = 0;
+  // Make sure all extrusions are deleted on a hard reset
+  clearExtrusions();
+  // Hide any not-yet-filled part of the surface
+  updateSurfaceDrawRange();
+  // Clear per-slice modules
+  clearSliceModules();
+  lastSliceAmps = new Float32Array(pointsPerSlice);
 }
 
 // Cleanup on hot reload
