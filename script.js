@@ -1405,8 +1405,8 @@ exportBtn.addEventListener('click', () => {
     synthesizeCapturedFromSurface();
   }
   const { objText, mtlText } = buildOBJFromCaptured();
-  downloadTextAsFile('dialup_spectrogram.mtl', mtlText);
-  downloadTextAsFile('dialup_spectrogram.obj', objText);
+  downloadTextAsFile('3D_spectrogram.mtl', mtlText);
+  downloadTextAsFile('3D_spectrogram.obj', objText);
 });
 
 if (exportStlBtn) {
@@ -1420,7 +1420,7 @@ if (exportStlBtn) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'dialup_spectrogram.stl';
+    a.download = '3D_spectrogram.stl';
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -1863,7 +1863,7 @@ function buildOBJFromCaptured() {
 
   const header = [
     '# Dial-up spectrogram export',
-    'mtllib dialup_spectrogram.mtl',
+    'mtllib 3D_spectrogram.mtl',
     'g spectrogram',
   ];
   const objText = header.concat(v).concat(f).join('\n');
