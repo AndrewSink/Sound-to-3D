@@ -9,9 +9,9 @@ const toggleAxesBtn = document.getElementById('toggleAxesBtn');
 const resetBtn = document.getElementById('resetBtn');
 const fileInput = document.getElementById('fileInput');
 const exportBtn = document.getElementById('exportBtn');
+const exportStlBtn = document.getElementById('exportStlBtn');
 const audioEl = document.getElementById('audioEl');
 const recordBtn = document.getElementById('recordBtn');
-const trimBtn = document.getElementById('trimBtn');
 
 // -------- Audio setup --------
 const audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -82,6 +82,89 @@ const activeFrequencyFraction = 0.75; // show first ~75% of rows; collapse the r
 const frequencyExponent = 0.65; // <1 spreads low/mid frequencies
 const noiseFloor = 0.03; // ignore very small magnitudes
 
+// Surface smoothing to avoid knife-edges and produce a printable, continuous wave
+// - Temporal smoothing spreads peaks across adjacent slices (along X)
+// - Frequency smoothing blends neighboring bins (along Z)
+const timeSmoothWindow = 7;    // odd size preferred (number of slices)
+const freqSmoothWindow = 5;    // odd size preferred (number of bins)
+const timeSigma = timeSmoothWindow / 3; // Gaussian sigma
+const freqSigma = freqSmoothWindow / 3; // Gaussian sigma
+let sliceHistory = []; // recent raw slices (Float32Array)
+
+function makeGaussianKernel(size, sigma) {
+  const n = Math.max(1, Math.floor(size) | 1); // force odd
+  const s2 = sigma > 0 ? (2 * sigma * sigma) : 1;
+  const half = (n - 1) / 2;
+  const k = new Float32Array(n);
+  let sum = 0;
+  for (let i = -half, j = 0; j < n; i++, j++) {
+    const w = Math.exp(-(i * i) / s2);
+    k[j] = w; sum += w;
+  }
+  for (let j = 0; j < n; j++) k[j] /= sum;
+  return k;
+}
+
+function reflectedIndex(i, n) {
+  // Reflect at boundaries: -1->1, n->n-2, etc.
+  if (n <= 1) return 0;
+  const period = 2 * (n - 1);
+  let m = i % period; if (m < 0) m += period;
+  return m <= (n - 1) ? m : period - m;
+}
+
+const Kt = makeGaussianKernel(timeSmoothWindow, timeSigma);
+const Kz = makeGaussianKernel(freqSmoothWindow, freqSigma);
+
+function smoothAcrossFrequency(src) {
+  const n = src.length;
+  const half = (Kz.length - 1) / 2;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let acc = 0;
+    for (let j = -half, k = 0; k < Kz.length; j++, k++) {
+      const idx = reflectedIndex(i + j, n);
+      acc += src[idx] * Kz[k];
+    }
+    out[i] = acc;
+  }
+  return out;
+}
+
+function smoothAcrossTimeWithHistory(newSlice) {
+  sliceHistory.push(newSlice);
+  if (sliceHistory.length > Kt.length) sliceHistory.shift();
+  // Weighted average of available history, normalized to available weights
+  const nAvail = sliceHistory.length;
+  const half = (Kt.length - 1) / 2;
+  // Center the kernel at the newest slice
+  const out = new Float32Array(newSlice.length);
+  let weightSum = 0;
+  for (let o = 0; o < nAvail; o++) {
+    const kIndex = Kt.length - 1 - o; // newest aligns with kernel center
+    const w = Kt[Math.max(0, Math.min(Kt.length - 1, kIndex))];
+    weightSum += w;
+  }
+  const norm = weightSum > 0 ? (1 / weightSum) : 1;
+  for (let i = 0; i < out.length; i++) {
+    let acc = 0; let wsum = 0; // track exact weight sum of available terms
+    for (let o = 0; o < nAvail; o++) {
+      const kIndex = Kt.length - 1 - o;
+      const w = Kt[Math.max(0, Math.min(Kt.length - 1, kIndex))];
+      acc += sliceHistory[nAvail - 1 - o][i] * w;
+      wsum += w;
+    }
+    out[i] = wsum > 0 ? (acc / wsum) : newSlice[i];
+  }
+  return out;
+}
+
+function processSliceForSurface(rawSlice) {
+  const tSmoothed = smoothAcrossTimeWithHistory(rawSlice);
+  const zSmoothed = smoothAcrossFrequency(tSmoothed);
+  return zSmoothed;
+}
+
 const numSlicesInitial = 1024; // initial capacity
 const width = 400; // initial visual width used to derive slice spacing
 const depth = 80; // z extent (frequency)
@@ -121,6 +204,7 @@ scene.add(surface);
 surface.visible = false;
 
 // Enable per-slice geometry generation (append-only modules each frame)
+// Legacy deformable surface path is fully disabled
 const USE_PER_SLICE_GEOMETRY = true;
 
 // Group to hold per-slice modules (top strip + helper geometry spans)
@@ -504,191 +588,22 @@ function buildReferenceGrid(widthOverride, clipStartX = 0, clipEndX = 0) {
   gridGroup.add(lines);
 }
 
-// -------- Trim handles and clipping --------
-let trimActive = false;
-let trimStartX = 0;
-let trimEndX = 0;
 // Tracks the world-space X where the current spectrogram geometry starts
 let worldLeftOffsetX = 0;
-const trimGroup = new THREE.Group();
-scene.add(trimGroup);
-
-// Use total frequency span; avoids referencing zMin/zMax before init
-const handleDepth = () => depth + 0.5;
-const amplitudeMaxYRef = () => depth * heightScale;
-
-function createTrimHandle(color) {
-  const geo = new THREE.BoxGeometry(0.6, amplitudeMaxYRef() + 2, handleDepth());
-  const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.95 });
-  // Ensure trim handles never occlude the grid or spectrogram visuals while dragging
-  mat.depthTest = false;
-  mat.depthWrite = false;
-  mat.toneMapped = false;
-  mat.side = THREE.DoubleSide;
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.y = (amplitudeMaxYRef()) / 2;
-  mesh.renderOrder = 3;
-  mesh.userData.isTrimHandle = true;
-  // Store base/hover colors for quick visual feedback on hover
-  mesh.userData.baseColor = new THREE.Color(color);
-  mesh.userData.hoverColor = mesh.userData.baseColor.clone().multiplyScalar(0.8);
-  return mesh;
-}
-
-const leftHandle = createTrimHandle(0x22d3ee); // cyan
-const rightHandle = createTrimHandle(0xf43f5e); // rose
-trimGroup.add(leftHandle);
-trimGroup.add(rightHandle);
-trimGroup.visible = false;
-
-const leftClip = new THREE.Plane(new THREE.Vector3(1, 0, 0), 0);
-const rightClip = new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0);
 
 function getCurrentMaxX() {
   const slices = Math.max(currentSliceIndex, capturedSlices.length);
   return Math.max(0, (Math.max(2, slices) - 1) * sliceSpacing);
 }
 
-function setTrimRange(startX, endX) {
-  const maxX = getCurrentMaxX();
-  trimStartX = Math.max(0, Math.min(startX, maxX - sliceSpacing));
-  trimEndX = Math.max(trimStartX + sliceSpacing, Math.min(endX, maxX));
-  // Update handles
-  leftHandle.position.x = trimStartX;
-  rightHandle.position.x = trimEndX;
-  // Update clipping planes (keep between start and end)
-  leftClip.constant = -trimStartX; // keep x >= start
-  rightClip.constant = trimEndX;   // with normal (-1,0,0): keep x <= end
-  material.clippingPlanes = trimActive ? [leftClip, rightClip] : [];
-  // Keep the grid visible while trimming by extending and clipping ahead of the active range
-  const gridTotalWidth = Math.max(sliceSpacing * (capacity - 1), maxX + sliceSpacing * 100);
-  // Draw grid on both sides of the active window while trimming
-  buildReferenceGrid(gridTotalWidth, trimStartX - 0.5 * sliceSpacing, trimEndX + 0.5 * sliceSpacing);
-}
+// Trim functionality removed
 
-function enableTrimMode(enable) {
-  trimActive = enable;
-  trimGroup.visible = enable;
-  if (enable) {
-    // Pause playback and gray out all controls except Reset and Done (Trim)
-    try { if (!audioEl.paused) audioEl.pause(); } catch { }
-    isCapturing = false;
-    setPlayButtonState(false);
-    setControlsForTrimMode(true);
-    const widthX = getCurrentMaxX();
-    // Initialize handles to the current geometry extents in world space
-    const leftX = Math.max(0, worldLeftOffsetX);
-    setTrimRange(leftX, leftX + Math.max(sliceSpacing, widthX));
-  } else {
-    material.clippingPlanes = [];
-    // Re-enable controls after trimming
-    setControlsForTrimMode(false);
-  }
-}
+// Trim functionality removed
 
-function applyTrimPermanent() {
-  // Ensure we have slice data; if not, synthesize from current geometry
-  if (capturedSlices.length < 2) {
-    synthesizeCapturedFromSurface();
-  }
-  const total = capturedSlices.length;
-  if (total < 2) {
-    // Nothing to trim
-    enableTrimMode(false);
-    return;
-  }
-  const startSlice = Math.max(0, Math.floor(trimStartX / sliceSpacing));
-  const endSlice = Math.max(startSlice + 1, Math.min(total - 1, Math.ceil(trimEndX / sliceSpacing)));
-  const trimmed = capturedSlices.slice(startSlice, endSlice + 1);
-  capturedSlices.length = 0;
-  for (const s of trimmed) capturedSlices.push(s);
-  // Rebuild the geometry to the trimmed range
-  isCapturing = false;
-  hasEnded = true;
-  // Preserve original world X by keeping left edge at original start position
-  const leftOffsetX = trimStartX;
-  finalizeModelGeometry(leftOffsetX);
-  worldLeftOffsetX = leftOffsetX;
-  frameWholeModel();
-  enableTrimMode(false);
-  setTrimAvailability(true);
-  setExportAvailability(true);
-}
+// Trim functionality removed
 
 // Dragging logic
-const raycaster = new THREE.Raycaster();
-const pointer = new THREE.Vector2();
-const dragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0); // y=0
-let draggingHandle = null; // 'left' | 'right' | null
-let hoverHandle = null; // current handle under the pointer
-
-function setHandleHover(handle, isHover) {
-  if (!handle || !handle.material) return;
-  const target = isHover ? handle.userData.hoverColor : handle.userData.baseColor;
-  handle.material.color.copy(target);
-  handle.material.needsUpdate = true;
-}
-
-function updateHoverFromPointer(evt) {
-  if (!trimActive || draggingHandle) return; // no hover while dragging or when trim off
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-  let newHover = null;
-  const hits = raycaster.intersectObjects([leftHandle, rightHandle], false);
-  if (hits && hits.length) newHover = hits[0].object;
-  if (hoverHandle !== newHover) {
-    setHandleHover(leftHandle, newHover === leftHandle);
-    setHandleHover(rightHandle, newHover === rightHandle);
-    // Do not change the cursor; only use color to signal interactivity
-    hoverHandle = newHover;
-  }
-}
-
-function onPointerMove(evt) {
-  if (!draggingHandle) return;
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-  const hit = new THREE.Vector3();
-  if (raycaster.ray.intersectPlane(dragPlane, hit)) {
-    if (draggingHandle === 'left') {
-      setTrimRange(hit.x, trimEndX);
-    } else if (draggingHandle === 'right') {
-      setTrimRange(trimStartX, hit.x);
-    }
-  }
-}
-
-function onPointerDown(evt) {
-  if (!trimActive) return;
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-  const hits = raycaster.intersectObjects([leftHandle, rightHandle], false);
-  if (hits && hits.length) {
-    const obj = hits[0].object;
-    draggingHandle = (obj === leftHandle) ? 'left' : 'right';
-    controls.enabled = false;
-    window.addEventListener('pointermove', onPointerMove);
-    window.addEventListener('pointerup', onPointerUp, { once: true });
-    // No cursor change on drag start
-  }
-}
-
-function onPointerUp() {
-  window.removeEventListener('pointermove', onPointerMove);
-  draggingHandle = null;
-  controls.enabled = true;
-  // Restore default cursor
-  renderer.domElement.style.cursor = 'auto';
-}
-
-renderer.domElement.addEventListener('pointerdown', onPointerDown);
-renderer.domElement.addEventListener('pointermove', updateHoverFromPointer);
+// Trim functionality removed
 
 // Removed helper ground grid
 
@@ -794,23 +709,28 @@ function updateSurfaceFromFrequencies() {
     newSlice[i] = emphasized;
   }
 
-  // Persist the full-resolution slice for export later
+  // Apply smoothing across time (with history) and frequency to avoid knife-edges
+  const processed = processSliceForSurface(newSlice);
+
+  // Persist the smoothed slice for export later
   if (isCapturing) {
-    capturedSlices.push(newSlice.slice());
+    capturedSlices.push(processed.slice());
   }
 
-  // Grow geometry if needed
+  // Grow backing buffers if needed to maintain z mapping for export/sampling
   if (currentSliceIndex >= capacity) {
     const nextCapacity = Math.ceil(capacity * 1.6);
     expandGeometry(nextCapacity);
+    // Keep legacy surface hidden after growth
+    surface.visible = false;
   }
 
   // For each z-row (frequency), write this slice at the current column
   for (let z = 0; z < pointsPerSlice; z++) {
     const vIndex = z * capacity + currentSliceIndex;
-    const y = newSlice[z] * depth * heightScale;
+    const y = processed[z] * depth * heightScale;
     positionAttr.setY(vIndex, y);
-    const color = referenceColorRamp(newSlice[z]);
+    const color = referenceColorRamp(processed[z]);
     const cIdx = vIndex * 3;
     colors[cIdx + 0] = color.r;
     colors[cIdx + 1] = color.g;
@@ -821,16 +741,9 @@ function updateSurfaceFromFrequencies() {
   positionAttr.needsUpdate = true;
   geometry.attributes.color.needsUpdate = true;
 
-  // Per-slice path: append module instead of relying on deformable surface
-  if (USE_PER_SLICE_GEOMETRY) {
-    appendSliceModule(lastSliceAmps, newSlice);
-    lastSliceAmps = newSlice;
-  } else {
-    // Update watertight extrusions in real time (legacy path)
-    updateExtrusionsRealtime();
-    // Only draw indices for the filled region so the remainder stays invisible
-    updateSurfaceDrawRange();
-  }
+  // Per-slice path only: append module for the new slice (smoothed)
+  appendSliceModule(lastSliceAmps, processed);
+  lastSliceAmps = processed;
 }
 
 // Color ramp designed to match the reference look:
@@ -870,6 +783,105 @@ function referenceColorRamp(t) {
 // amplitude ticks along Y at the back-left corner. Labels are sprites.
 const axesGroup = new THREE.Group();
 scene.add(axesGroup);
+
+// Frequency axis world X position (used for axis placement and frequency grid clipping)
+const frequencyAxisX = -2;
+
+// Infinite grid that renders only on the left side of the frequency axis (x <= frequencyAxisX)
+const freqGridGroup = new THREE.Group();
+scene.add(freqGridGroup);
+
+function clearFrequencyGrid() {
+  while (freqGridGroup.children.length) {
+    const child = freqGridGroup.children.pop();
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) child.material.dispose && child.material.dispose();
+  }
+}
+
+function buildFrequencyAxisGrid() {
+  clearFrequencyGrid();
+  const size = 100000; // effectively infinite at our scene scale
+  const geo = new THREE.PlaneGeometry(size, size, 1, 1);
+  geo.rotateX(-Math.PI / 2);
+  // Place below the helper base so it never clips with geometry (extra 0.5 units down)
+  geo.translate(0, -baseThickness - 0.55, 0);
+  // Compute Z clipping range to show only between 0 Hz and 15k on the axis
+  const nyquistHz = audioContext.sampleRate / 2;
+  function zAtHz(hz) {
+    const clamped = Math.max(0, Math.min(nyquistHz, hz));
+    const binIndex = (clamped / nyquistHz) * freqBinCount; // 0..freqBinCount
+    const rowIndex = Math.round(binIndex / sliceStride);
+    const idx = Math.max(0, Math.min(pointsPerSlice - 1, rowIndex));
+    // Constrain to active band so we don't go into the collapsed region
+    const activeIdx = Math.max(0, Math.min(activeRows - 1, idx));
+    return zRowPositions[activeIdx];
+  }
+  const zClipMin = zAtHz(0);
+  const zClipMax = zAtHz(15000);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uMinor: { value: 4.0 },
+      uMajor: { value: 20.0 },
+      uColorMinor: { value: new THREE.Color(0x3f3f46) },
+      uColorMajor: { value: new THREE.Color(0x3f3f46) },
+      uOpacity: { value: 0.65 },
+      uClipX: { value: frequencyAxisX - 1e-4 }, // include the axis line (right side)
+      uZMin: { value: Math.min(zClipMin, zClipMax) },
+      uZMax: { value: Math.max(zClipMin, zClipMax) },
+    },
+    transparent: true,
+    depthTest: true,
+    depthWrite: false,
+    toneMapped: false,
+    side: THREE.DoubleSide,
+    extensions: { derivatives: true },
+    vertexShader: `
+      varying vec3 vWorld;
+      void main(){
+        vec4 w = modelMatrix * vec4(position, 1.0);
+        vWorld = w.xyz;
+        gl_Position = projectionMatrix * viewMatrix * w;
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vWorld;
+      uniform float uMinor;
+      uniform float uMajor;
+      uniform vec3 uColorMinor;
+      uniform vec3 uColorMajor;
+      uniform float uOpacity;
+      uniform float uClipX;
+      uniform float uZMin;
+      uniform float uZMax;
+
+      float gridFactor(vec2 p, float step, float width){
+        vec2 q = p / step;
+        vec2 w = abs(fract(q - 0.5) - 0.5) / fwidth(q);
+        float line = min(w.x, w.y);
+        return 1.0 - smoothstep(width, width + 1.0, line);
+      }
+
+      void main(){
+        // Show only on the RIGHT side of the frequency axis
+        if (vWorld.x < uClipX) discard;
+        // Restrict to 0..15k Hz span on Z
+        if (vWorld.z < uZMin || vWorld.z > uZMax) discard;
+        vec2 p = vWorld.xz;
+        float minor = gridFactor(p, uMinor, 0.8);
+        float major = gridFactor(p, uMajor, 1.2);
+        float a = max(major, minor * 0.6) * uOpacity;
+        vec3 col = mix(uColorMinor, uColorMajor, step(minor, major));
+        gl_FragColor = vec4(col, a);
+      }
+    `,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  // Render the grid before opaque geometry; since it doesn't write depth,
+  // later draws (spectrogram/base) will fully occlude it.
+  mesh.renderOrder = -100;
+  freqGridGroup.add(mesh);
+}
 
 function disposeObjectRecursive(object3d) {
   object3d.traverse((node) => {
@@ -943,7 +955,7 @@ function buildAxesAndTicks() {
   clearAxesGroup();
 
   // Place axes on the left side of the mesh at a fixed world X (slightly left of x=0)
-  const axisX = -2; // just left of surface's anchored left edge (x=0)
+  const axisX = frequencyAxisX; // just left of surface's anchored left edge (x=0)
   const backZ = zMin;
   const frontActiveZ = zRowPositions[Math.max(0, activeRows - 1)];
   const amplitudeMaxY = depth * heightScale;
@@ -1027,6 +1039,7 @@ function buildAxesAndTicks() {
 
 // Build initial axes now that geometry mapping is known
 buildAxesAndTicks();
+buildFrequencyAxisGrid();
 
 // Place the camera so the view centers between the axes (left) and the surface (center),
 // backed up and slightly orbiting to the right similar to the reference angle.
@@ -1048,9 +1061,10 @@ function positionCameraOverview() {
   controls.saveState && controls.saveState();
 }
 
+// Only set the initial overview once on load; do not reset camera on play
 positionCameraOverview();
 
-// Ensure the surface is visible before audio plays
+// Initialize visualization state (keep legacy surface hidden)
 resetVisualization();
 
 // (Removed initial procedural preview per request)
@@ -1079,10 +1093,8 @@ function animate() {
   requestAnimationFrame(animate);
   if ((isRecording || (!audioEl.paused && !hasEnded))) {
     updateSurfaceFromFrequencies();
-    // Reveal surface when data starts arriving
-    if (!surface.visible) surface.visible = true;
-    // When surface is visible, let depth testing occlude the grid naturally
-    gridGroup.traverse((obj) => { obj.renderOrder = 0; });
+    // Only per-slice modules are rendered during growth; keep legacy surface hidden
+    surface.visible = false;
   }
   controls.update();
   renderer.render(scene, camera);
@@ -1131,20 +1143,11 @@ function setPlayButtonState(isPlaying) {
 function setExportAvailability(enabled) {
   if (!exportBtn) return;
   exportBtn.disabled = !enabled;
+  if (exportStlBtn) exportStlBtn.disabled = !enabled;
 }
 
-function setTrimAvailability(enabled) {
-  if (!trimBtn) return;
-  trimBtn.disabled = !enabled;
-  if (enabled) {
-    trimBtn.classList.remove('opacity-40', 'cursor-not-allowed');
-  } else {
-    trimBtn.classList.add('opacity-40', 'cursor-not-allowed');
-    // Ensure we exit trim mode if it was on
-    if (trimActive) enableTrimMode(false);
-    trimBtn.textContent = 'Trim';
-  }
-}
+// Trim functionality removed: keep a no-op for calls from existing flows
+function setTrimAvailability() { }
 
 function setRecordButtonState(isRec) {
   if (!recordBtn) return;
@@ -1179,27 +1182,8 @@ function setRecordAvailability(enabled) {
   }
 }
 
-function setControlsForTrimMode(active) {
-  // Disable everything except Reset and Trim (which shows 'Done' while active)
-  const toToggle = [playBtn, recordBtn, exportBtn, toggleAxesBtn, fileInput];
-  for (const el of toToggle) {
-    if (!el) continue;
-    el.disabled = !!active;
-  }
-  // Visual feedback for buttons
-  const toStyle = [playBtn, recordBtn, exportBtn, toggleAxesBtn];
-  for (const el of toStyle) {
-    if (!el) continue;
-    if (active) el.classList.add('opacity-40', 'cursor-not-allowed');
-    else el.classList.remove('opacity-40', 'cursor-not-allowed');
-  }
-  // File input label styling
-  const fileLabel = document.querySelector('label[for="fileInput"]');
-  if (fileLabel) {
-    if (active) fileLabel.classList.add('opacity-40', 'cursor-not-allowed', 'pointer-events-none');
-    else fileLabel.classList.remove('opacity-40', 'cursor-not-allowed', 'pointer-events-none');
-  }
-}
+// Trim functionality removed: keep a no-op for calls from existing flows
+function setControlsForTrimMode() { }
 
 // Disable specific controls while recording: Play, Load Audio, Hide Axes, Reset
 function setControlsForRecording(active) {
@@ -1264,12 +1248,8 @@ async function startRecording() {
       isCapturing = false;
       isRecording = false;
       disconnectMic();
-      // Ensure we have slice data even for very short recordings
+      // Do not rebuild/finalize geometry here; keep current per-slice modules
       if (capturedSlices.length < 2) synthesizeCapturedFromSurface();
-      finalizeModelGeometry();
-      // Make helper geometry visible and updated
-      surface.visible = true;
-      updateExtrusionsRealtime();
       frameWholeModel();
       setRecordButtonState(false);
       setExportAvailability(true);
@@ -1352,9 +1332,8 @@ resetBtn.addEventListener('click', () => {
   capturedSlices.length = 0;
   hardResetVisualization();
   setExportAvailability(false);
-  setTrimAvailability(false);
-  // Exit trim mode if active and restore control availability
-  if (trimActive) enableTrimMode(false);
+  // Trim functionality removed
+  // Trim functionality removed; ensure any trim-specific disables are cleared (no-op)
   // After reset, ensure no recording-specific disables remain
   setControlsForRecording(false);
 });
@@ -1376,7 +1355,7 @@ fileInput.addEventListener('change', async (e) => {
   audioEl.play();
   isCapturing = true;
   setExportAvailability(false);
-  setTrimAvailability(false);
+  // Trim functionality removed
 });
 
 // Drag & drop support
@@ -1398,7 +1377,7 @@ window.addEventListener('drop', (e) => {
   audioEl.play();
   isCapturing = true;
   setExportAvailability(false);
-  setTrimAvailability(false);
+  // Trim functionality removed
 });
 
 // Auto-start visualization when audio starts
@@ -1407,18 +1386,16 @@ audioEl.addEventListener('play', () => {
   setPlayButtonState(true);
   // Enable export once at least one slice lands
   setExportAvailability(true);
-  setTrimAvailability(true);
+  // Trim functionality removed
 });
 
 audioEl.addEventListener('ended', () => {
   hasEnded = true;
   isCapturing = false;
-  finalizeModelGeometry();
-  // back the camera up a bit so the entire model is in view
+  // Only move the camera to frame the current model; do not rebuild or finalize geometry
   frameWholeModel();
   setPlayButtonState(false);
-  // Allow trimming finalized model
-  setTrimAvailability(true);
+  // Trim functionality removed
 });
 
 exportBtn.addEventListener('click', () => {
@@ -1432,6 +1409,25 @@ exportBtn.addEventListener('click', () => {
   downloadTextAsFile('dialup_spectrogram.obj', objText);
 });
 
+if (exportStlBtn) {
+  exportStlBtn.addEventListener('click', () => {
+    if (capturedSlices.length < 2) {
+      // Synthesize from on-screen geometry to always have something to export
+      synthesizeCapturedFromSurface();
+    }
+    const stlBuffer = buildSTLFromCaptured();
+    const blob = new Blob([stlBuffer], { type: 'application/vnd.ms-pki.stl' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'dialup_spectrogram.stl';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+}
+
 if (recordBtn) {
   recordBtn.addEventListener('click', async () => {
     if (!isRecording) {
@@ -1442,18 +1438,7 @@ if (recordBtn) {
   });
 }
 
-if (trimBtn) {
-  trimBtn.addEventListener('click', () => {
-    if (!trimActive) {
-      enableTrimMode(true);
-      trimBtn.textContent = 'Done';
-    } else {
-      // Commit the trim and exit
-      applyTrimPermanent();
-      trimBtn.textContent = 'Trim';
-    }
-  });
-}
+// Trim functionality removed
 
 // Rebuild the surface geometry to display the full captured model when playback finishes
 function finalizeModelGeometry(leftOffsetX = 0) {
@@ -1594,7 +1579,7 @@ function finalizeModelGeometry(leftOffsetX = 0) {
   unifiedMesh = new THREE.Mesh(unifiedGeo, materials);
   scene.add(unifiedMesh);
 
-  // Hide legacy pieces
+  // Hide legacy surface
   surface.visible = false;
   worldLeftOffsetX = leftOffsetX;
 }
@@ -1623,11 +1608,7 @@ function buildOBJFromCaptured() {
   let slices = capturedSlices.length;
   let startSlice = 0;
   let endSlice = slices - 1;
-  if (trimActive && slices > 1) {
-    startSlice = Math.max(0, Math.floor(trimStartX / sliceSpacing));
-    endSlice = Math.max(startSlice + 1, Math.min(slices - 1, Math.ceil(trimEndX / sliceSpacing)));
-    slices = endSlice - startSlice + 1;
-  }
+  // Trim is disabled in this build; export the full captured range
   const activeRowsCount = Math.max(2, Math.floor(pointsPerSlice * activeFrequencyFraction));
   // Use only the active frequency band plus one front boundary row to avoid degenerate cells
   const bins = activeRowsCount + 1;
@@ -1661,8 +1642,12 @@ function buildOBJFromCaptured() {
   const baseMat = materialNameForColor(baseColor);
 
   function pushV(x, y, z, r, g, b) {
-    v.push(`v ${x.toFixed(5)} ${y.toFixed(5)} ${z.toFixed(5)}`);
-    vx.push(x); vy.push(y); vz.push(z);
+    // Export with Z-up and match on-screen left/right: (X=x, Y=-z, Z=y+baseThickness)
+    const X = x;
+    const Y = -z; // flip Y to avoid mirrored appearance in DCCs
+    const Z = y + baseThickness; // puts the flat base at Z=0
+    v.push(`v ${X.toFixed(5)} ${Y.toFixed(5)} ${Z.toFixed(5)}`);
+    vx.push(X); vy.push(Y); vz.push(Z);
     return v.length; // 1-based index
   }
 
@@ -1683,10 +1668,11 @@ function buildOBJFromCaptured() {
     }
   }
 
-  const OUT_TOP = { x: 0, y: 1, z: 0 };
-  const OUT_BOTTOM = { x: 0, y: -1, z: 0 };
-  const OUT_FRONT = { x: 0, y: 0, z: 1 };
-  const OUT_BACK = { x: 0, y: 0, z: -1 };
+  // With Z-up export and Y flipped, outward directions adjust accordingly
+  const OUT_TOP = { x: 0, y: 0, z: 1 };
+  const OUT_BOTTOM = { x: 0, y: 0, z: -1 };
+  const OUT_FRONT = { x: 0, y: -1, z: 0 };
+  const OUT_BACK = { x: 0, y: 1, z: 0 };
   const OUT_LEFT = { x: -1, y: 0, z: 0 };
   const OUT_RIGHT = { x: 1, y: 0, z: 0 };
 
@@ -1900,6 +1886,219 @@ function buildOBJFromCaptured() {
   return { objText, mtlText };
 }
 
+// Build a single-color binary STL from the captured unified shape.
+// Uses the exact same geometry/ordering as OBJ and the same export mapping:
+// render (x,y,z) -> export (X=x, Y=-z, Z=y+baseThickness)
+function buildSTLFromCaptured() {
+  let slices = capturedSlices.length;
+  if (slices < 2) return new ArrayBuffer(0);
+  const activeRowsCount = Math.max(2, Math.floor(pointsPerSlice * activeFrequencyFraction));
+  const bins = activeRowsCount + 1;
+  const dx = sliceSpacing;
+  const x0 = 0;
+  const z0 = -depth / 2;
+  const baseY = -baseThickness;
+
+  const indexTop = Array.from({ length: slices }, () => new Array(bins));
+  const yTop = Array.from({ length: slices }, () => new Array(bins));
+  const verts = []; // render-space vertices
+  function pushV(x, y, z) { verts.push({ x, y, z }); return verts.length - 1; }
+
+  const zAt = new Array(bins);
+  for (let j = 0; j < bins; j++) {
+    let z;
+    if (j < activeRowsCount) {
+      const t = j / (activeRowsCount - 1);
+      const tExp = Math.pow(t, frequencyExponent);
+      z = z0 + tExp * depth;
+    } else {
+      z = z0 + depth;
+    }
+    zAt[j] = z;
+  }
+
+  // Top vertices (with near-flat clamp like OBJ exporter)
+  const flatEps = 0.02 * depth * heightScale;
+  for (let i = 0; i < slices; i++) {
+    indexTop[i] = new Array(bins);
+    const x = x0 + dx * i;
+    const slice = capturedSlices[i];
+    for (let j = 0; j < bins; j++) {
+      const z = zAt[j];
+      const amp = (j < activeRowsCount) ? slice[j] : 0;
+      let y = amp * depth * heightScale;
+      if (y < flatEps) y = 0; // clamp near-flat to exactly 0 for merge
+      indexTop[i][j] = pushV(x, y, z);
+      yTop[i][j] = y;
+    }
+  }
+
+  // Bottom boundary vertices
+  const bottomBack = new Array(slices);
+  const bottomFront = new Array(slices);
+  const bottomLeft = new Array(bins);
+  const bottomRight = new Array(bins);
+  for (let i = 0; i < slices; i++) {
+    const x = x0 + dx * i;
+    bottomBack[i] = pushV(x, baseY, z0);
+    bottomFront[i] = pushV(x, baseY, z0 + depth);
+  }
+  for (let j = 0; j < bins; j++) {
+    bottomLeft[j] = pushV(x0, baseY, zAt[j]);
+    bottomRight[j] = pushV(x0 + dx * (slices - 1), baseY, zAt[j]);
+  }
+
+  // Collect oriented triangles in export-space (Z-up, Y flipped)
+  const tris = [];
+  function mapToExport(p) { return { X: p.x, Y: -p.z, Z: p.y + baseThickness }; }
+  function addTriOriented(i1, i2, i3, desired) {
+    const A = mapToExport(verts[i1]);
+    const B = mapToExport(verts[i2]);
+    const C = mapToExport(verts[i3]);
+    let abx = B.X - A.X, aby = B.Y - A.Y, abz = B.Z - A.Z;
+    let acx = C.X - A.X, acy = C.Y - A.Y, acz = C.Z - A.Z;
+    let nx = aby * acz - abz * acy;
+    let ny = abz * acx - abx * acz;
+    let nz = abx * acy - aby * acx;
+    const dot = nx * desired.x + ny * desired.y + nz * desired.z;
+    if (dot < 0) {
+      // swap B and C to flip
+      const tmpX = B.X, tmpY = B.Y, tmpZ = B.Z;
+      B.X = C.X; B.Y = C.Y; B.Z = C.Z;
+      C.X = tmpX; C.Y = tmpY; C.Z = tmpZ;
+      abx = B.X - A.X; aby = B.Y - A.Y; abz = B.Z - A.Z;
+      acx = C.X - A.X; acy = C.Y - A.Y; acz = C.Z - A.Z;
+      nx = aby * acz - abz * acy;
+      ny = abz * acx - abx * acz;
+      nz = abx * acy - aby * acx;
+    }
+    const len = Math.hypot(nx, ny, nz) || 1;
+    tris.push([{ x: nx / len, y: ny / len, z: nz / len }, A, B, C]);
+  }
+
+  // Outward directions in export space with Y flipped
+  const OUT_TOP = { x: 0, y: 0, z: 1 };
+  const OUT_BOTTOM = { x: 0, y: 0, z: -1 };
+  const OUT_FRONT = { x: 0, y: -1, z: 0 };
+  const OUT_BACK = { x: 0, y: 1, z: 0 };
+  const OUT_LEFT = { x: -1, y: 0, z: 0 };
+  const OUT_RIGHT = { x: 1, y: 0, z: 0 };
+
+  // Triangulate top surface with coplanar merge on near-flat regions (mirror of OBJ)
+  const flatCell = Array.from({ length: slices - 1 }, () => new Array(bins - 1).fill(false));
+  for (let i = 0; i < slices - 1; i++) {
+    for (let j = 0; j < bins - 1; j++) {
+      const y00 = yTop[i][j];
+      const y10 = yTop[i + 1][j];
+      const y01 = yTop[i][j + 1];
+      const y11 = yTop[i + 1][j + 1];
+      flatCell[i][j] = y00 === 0 && y10 === 0 && y01 === 0 && y11 === 0;
+    }
+  }
+  const visited = Array.from({ length: slices - 1 }, () => new Array(bins - 1).fill(false));
+  for (let j = 0; j < bins - 1; j++) {
+    for (let i = 0; i < slices - 1; i++) {
+      if (visited[i][j]) continue;
+      if (!flatCell[i][j]) {
+        const a = indexTop[i][j];
+        const bIdx = indexTop[i + 1][j];
+        const cIdx = indexTop[i + 1][j + 1];
+        const d = indexTop[i][j + 1];
+        addTriOriented(a, bIdx, cIdx, OUT_TOP);
+        addTriOriented(a, cIdx, d, OUT_TOP);
+        visited[i][j] = true;
+        continue;
+      }
+      // Flat cell: grow rectangle (i..iW, j..jH)
+      let iW = i;
+      while (iW + 1 < slices - 1 && flatCell[iW + 1][j] && !visited[iW + 1][j]) iW++;
+      let jH = j;
+      let grow = true;
+      while (grow && jH + 1 < bins - 1) {
+        for (let k = i; k <= iW; k++) {
+          if (!flatCell[k][jH + 1] || visited[k][jH + 1]) { grow = false; break; }
+        }
+        if (grow) jH++;
+      }
+      const a = indexTop[i][j];
+      const bIdx = indexTop[iW + 1][j];
+      const cIdx = indexTop[iW + 1][jH + 1];
+      const d = indexTop[i][jH + 1];
+      addTriOriented(a, bIdx, cIdx, OUT_TOP);
+      addTriOriented(a, cIdx, d, OUT_TOP);
+      for (let jj = j; jj <= jH; jj++) {
+        for (let ii = i; ii <= iW; ii++) visited[ii][jj] = true;
+      }
+    }
+  }
+
+  // Close the front seam at the nonlinear-mapping boundary to avoid gaps
+  const jBoundary = Math.max(0, Math.min(bins - 2, activeRowsCount - 1));
+  for (let i = 0; i < slices - 1; i++) {
+    const a0 = indexTop[i][jBoundary];
+    const a1 = indexTop[i + 1][jBoundary];
+    const b0 = indexTop[i][jBoundary + 1];
+    const b1 = indexTop[i + 1][jBoundary + 1];
+    addTriOriented(a0, a1, b1, OUT_FRONT);
+    addTriOriented(a0, b1, b0, OUT_FRONT);
+  }
+  // Bottom big quad (two triangles)
+  const bl = bottomBack[0];
+  const br = bottomBack[slices - 1];
+  const fr = bottomFront[slices - 1];
+  const fl = bottomFront[0];
+  addTriOriented(bl, br, fr, OUT_BOTTOM);
+  addTriOriented(bl, fr, fl, OUT_BOTTOM);
+
+  // Walls
+  for (let i = 0; i < slices - 1; i++) {
+    // Back wall at z0
+    addTriOriented(indexTop[i][0], bottomBack[i], bottomBack[i + 1], OUT_BACK);
+    addTriOriented(indexTop[i][0], bottomBack[i + 1], indexTop[i + 1][0], OUT_BACK);
+    // Front wall at z0+depth
+    const jF = bins - 1;
+    addTriOriented(indexTop[i][jF], bottomFront[i], bottomFront[i + 1], OUT_FRONT);
+    addTriOriented(indexTop[i][jF], bottomFront[i + 1], indexTop[i + 1][jF], OUT_FRONT);
+  }
+  for (let j = 0; j < bins - 1; j++) {
+    // Left wall at x0
+    addTriOriented(indexTop[0][j], bottomLeft[j], bottomLeft[j + 1], OUT_LEFT);
+    addTriOriented(indexTop[0][j], bottomLeft[j + 1], indexTop[0][j + 1], OUT_LEFT);
+    // Right wall at x0 + dx*(slices-1)
+    const iR = slices - 1;
+    addTriOriented(indexTop[iR][j], bottomRight[j], bottomRight[j + 1], OUT_RIGHT);
+    addTriOriented(indexTop[iR][j], bottomRight[j + 1], indexTop[iR][j + 1], OUT_RIGHT);
+  }
+  // Ensure seams closed at top/bottom of left/right walls
+  addTriOriented(indexTop[0][bins - 2], indexTop[0][bins - 1], bottomLeft[bins - 1], OUT_LEFT);
+  addTriOriented(indexTop[0][bins - 2], bottomLeft[bins - 1], bottomLeft[bins - 2], OUT_LEFT);
+  addTriOriented(indexTop[slices - 1][bins - 2], bottomRight[bins - 2], indexTop[slices - 1][bins - 1], OUT_RIGHT);
+  addTriOriented(indexTop[slices - 1][bins - 1], bottomRight[bins - 2], bottomRight[bins - 1], OUT_RIGHT);
+
+  // Binary STL encoding
+  const triCount = tris.length;
+  const buffer = new ArrayBuffer(80 + 4 + triCount * 50);
+  const view = new DataView(buffer);
+  view.setUint32(80, triCount, true);
+  let offset = 84;
+  for (const [n, a, b, c] of tris) {
+    view.setFloat32(offset + 0, n.x, true);
+    view.setFloat32(offset + 4, n.y, true);
+    view.setFloat32(offset + 8, n.z, true);
+    view.setFloat32(offset + 12, a.X, true);
+    view.setFloat32(offset + 16, a.Y, true);
+    view.setFloat32(offset + 20, a.Z, true);
+    view.setFloat32(offset + 24, b.X, true);
+    view.setFloat32(offset + 28, b.Y, true);
+    view.setFloat32(offset + 32, b.Z, true);
+    view.setFloat32(offset + 36, c.X, true);
+    view.setFloat32(offset + 40, c.Y, true);
+    view.setFloat32(offset + 44, c.Z, true);
+    view.setUint16(offset + 48, 0, true);
+    offset += 50;
+  }
+  return buffer;
+}
 function downloadTextAsFile(filename, text) {
   const blob = new Blob([text], { type: 'text/plain' });
   const url = URL.createObjectURL(blob);
@@ -1927,7 +2126,7 @@ function resetVisualization() {
   geometry.attributes.color.needsUpdate = true;
   // Also clear any residual captured slices to avoid pre-populating export
   capturedSlices.length = 0;
-  // Hide surface until we start getting data so only grid is visible
+  // Keep legacy surface hidden; per-slice modules are the only visible geometry during growth
   surface.visible = false;
   // Ensure grid renders below surface by resetting any modified order
   gridGroup.traverse((obj) => { obj.renderOrder = 0; });
@@ -1935,6 +2134,8 @@ function resetVisualization() {
   clearExtrusions();
   clearUnifiedMesh();
   clearSliceModules();
+  // Clear smoothing history so a new session starts clean
+  sliceHistory.length = 0;
 }
 
 // Full reset: re-create the surface to initial capacity and clear indices
@@ -1951,17 +2152,15 @@ function hardResetVisualization() {
   resetVisualization();
   buildAxesAndTicks();
   buildReferenceGrid(undefined, 0);
-  // Optionally recenters the view near the beginning
-  positionCameraOverview();
   // Reset world-space offset when fully resetting the scene
   worldLeftOffsetX = 0;
   // Make sure all extrusions are deleted on a hard reset
   clearExtrusions();
-  // Hide any not-yet-filled part of the surface
-  updateSurfaceDrawRange();
+  // No drawRange updates; legacy surface is not used during growth
   // Clear per-slice modules
   clearSliceModules();
   lastSliceAmps = new Float32Array(pointsPerSlice);
+  sliceHistory.length = 0;
 }
 
 // Cleanup on hot reload
