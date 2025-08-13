@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>3D Spectrogram Generator</title>
+    <meta name="description" content="3D spectrogram visualizer for the classic dial‑up modem handshake sound." />
+    <link rel="preconnect" href="https://unpkg.com" crossorigin />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      html,
+      body {
+        height: 100%;
+      }
+
+      body {
+        background: #000;
+        color: #e5e7eb;
+      }
+
+      canvas {
+        display: block;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.140.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.140.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+
+  <body class="h-full">
+    <div class="flex flex-col h-full">
+      <header class="px-4 py-3 bg-zinc-900/70 backdrop-blur text-sm flex items-center justify-between">
+        <div class="font-medium text-zinc-100">3D Spectrogram - 3D Model Generator</div>
+      </header>
+
+      <main class="relative flex-1">
+        <div id="canvas-container" class="absolute inset-0"></div>
+
+        <div
+          class="absolute left-4 right-4 bottom-4 flex flex-wrap items-center gap-3 p-3 rounded-lg bg-zinc-900/70 backdrop-blur border border-zinc-800">
+          <button id="toggleAxesBtn" class="px-3 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-white text-sm">Hide
+            Axes</button>
+          <button id="playBtn"
+            class="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-sm">Play</button>
+          <button id="resetBtn"
+            class="px-3 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-white text-sm">Reset</button>
+          <button id="exportBtn" disabled
+            class="px-3 py-1.5 rounded bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-indigo-500 text-white text-sm">
+            Export OBJ
+          </button>
+
+          <label class="ml-2 text-xs opacity-80">Load audio:</label>
+          <input id="fileInput" type="file" accept="audio/*"
+            class="text-xs file:mr-3 file:px-3 file:py-1.5 file:rounded file:border-0 file:text-xs file:bg-zinc-700 file:text-white hover:file:bg-zinc-600" />
+
+          <span class="ml-auto text-xs text-zinc-400">Andrew Sink - 2025</span>
+          <a href="https://github.com/AndrewSink/dialup_visualizer" target="_blank" rel="noopener noreferrer"
+            class="text-xs text-zinc-300 hover:text-white underline underline-offset-2">Full Code on Github</a>
+        </div>
+
+        <audio id="audioEl" preload="auto" src="dialup.mp3" class="hidden"></audio>
+      </main>
+    </div>
+
+    <script type="module" src="./script.js"></script>
+  </body>
+
+</html>
