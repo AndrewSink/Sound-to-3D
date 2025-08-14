@@ -1091,6 +1091,9 @@ function frameWholeModel() {
 let isRendering = true;
 let flyCamActive = false;
 let flyCamAnchor = null; // { rel: THREE.Vector3, relLen: number, dxRight: number, targetY: number, targetZ: number }
+let autoFrameActive = false;
+let autoFrameDestPos = new THREE.Vector3();
+let autoFrameDestTarget = new THREE.Vector3();
 
 function enableFlyCam(active) {
   flyCamActive = !!active;
@@ -1118,6 +1121,33 @@ function enableFlyCam(active) {
     controls.enableZoom = true;
   }
 }
+
+function computeFrameWholeModelPose() {
+  const slices = Math.max(currentSliceIndex, capturedSlices.length);
+  const totalWidth = Math.max(1, slices - 1) * sliceSpacing;
+  const targetX = totalWidth * 0.55;
+  const targetY = depth * heightScale * 0.35;
+  const targetZ = 0;
+  const amplitudeMaxY = depth * heightScale;
+  const dz = Math.max(sliceSpacing * 300, totalWidth * 1.1);
+  const dx = sliceSpacing * 140;
+  const dy = amplitudeMaxY * 1.7;
+  return {
+    position: new THREE.Vector3(targetX + dx, targetY + dy, targetZ + dz),
+    target: new THREE.Vector3(targetX, targetY, targetZ),
+  };
+}
+
+function beginAutoFrameWholeModel() {
+  const pose = computeFrameWholeModelPose();
+  autoFrameDestPos.copy(pose.position);
+  autoFrameDestTarget.copy(pose.target);
+  autoFrameActive = true;
+  // Temporarily disable manual controls during the smooth frame
+  controls.enableRotate = false;
+  controls.enablePan = false;
+  controls.enableZoom = false;
+}
 function animate() {
   if (!isRendering) return;
   requestAnimationFrame(animate);
@@ -1141,6 +1171,21 @@ function animate() {
     const desiredPos = controls.target.clone().add(flyCamAnchor.rel);
     camera.position.lerp(desiredPos, 0.12);
     controls.update();
+  }
+  if (autoFrameActive) {
+    const t = 0.08; // easing factor per frame
+    camera.position.lerp(autoFrameDestPos, t);
+    controls.target.lerp(autoFrameDestTarget, t);
+    // Stop when close enough
+    if (camera.position.distanceTo(autoFrameDestPos) < 0.5 && controls.target.distanceTo(autoFrameDestTarget) < 0.2) {
+      camera.position.copy(autoFrameDestPos);
+      controls.target.copy(autoFrameDestTarget);
+      autoFrameActive = false;
+      controls.enableRotate = true;
+      controls.enablePan = true;
+      controls.enableZoom = true;
+      controls.update();
+    }
   }
   controls.update();
   renderer.render(scene, camera);
@@ -1444,8 +1489,14 @@ audioEl.addEventListener('play', () => {
 audioEl.addEventListener('ended', () => {
   hasEnded = true;
   isCapturing = false;
-  // Only move the camera to frame the current model; do not rebuild or finalize geometry
-  frameWholeModel();
+  // If tracking is active, stop following and smoothly frame the whole model
+  if (flyCamActive) {
+    enableFlyCam(false);
+    beginAutoFrameWholeModel();
+  } else {
+    // Maintain legacy behavior otherwise
+    frameWholeModel();
+  }
   setPlayButtonState(false);
   // Trim functionality removed
 });
