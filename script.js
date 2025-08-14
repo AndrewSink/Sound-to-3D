@@ -6,6 +6,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 const container = document.getElementById('canvas-container');
 const playBtn = document.getElementById('playBtn');
 const toggleAxesBtn = document.getElementById('toggleAxesBtn');
+const flyCamBtn = document.getElementById('flyCamBtn');
 const resetBtn = document.getElementById('resetBtn');
 const fileInput = document.getElementById('fileInput');
 const exportBtn = document.getElementById('exportBtn');
@@ -1088,6 +1089,35 @@ function frameWholeModel() {
 
 // -------- Animation loop --------
 let isRendering = true;
+let flyCamActive = false;
+let flyCamAnchor = null; // { rel: THREE.Vector3, relLen: number, dxRight: number, targetY: number, targetZ: number }
+
+function enableFlyCam(active) {
+  flyCamActive = !!active;
+  if (flyCamBtn) flyCamBtn.textContent = flyCamActive ? 'Stop Tracking' : 'Tracking Camera';
+  if (flyCamActive) {
+    // Capture current relative camera offset to target so angle is preserved
+    const rel = new THREE.Vector3().subVectors(camera.position, controls.target);
+    const slices = Math.max(currentSliceIndex, capturedSlices.length);
+    const totalWidth = Math.max(1, slices - 1) * sliceSpacing;
+    const rightX = worldLeftOffsetX + totalWidth;
+    flyCamAnchor = {
+      rel: rel.clone(),
+      relLen: rel.length(),
+      dxRight: controls.target.x - rightX, // keep same X offset from the growing right edge
+      targetY: controls.target.y,
+      targetZ: controls.target.z,
+    };
+    // Disable manual orbit/pan while flying
+    controls.enableRotate = false;
+    controls.enablePan = false;
+    controls.enableZoom = false;
+  } else {
+    controls.enableRotate = true;
+    controls.enablePan = true;
+    controls.enableZoom = true;
+  }
+}
 function animate() {
   if (!isRendering) return;
   requestAnimationFrame(animate);
@@ -1095,6 +1125,22 @@ function animate() {
     updateSurfaceFromFrequencies();
     // Only per-slice modules are rendered during growth; keep legacy surface hidden
     surface.visible = false;
+  }
+  // Update fly cam position to maintain angle and pull back as width grows
+  if (flyCamActive && flyCamAnchor) {
+    const slices = Math.max(currentSliceIndex, capturedSlices.length);
+    const totalWidth = Math.max(1, slices - 1) * sliceSpacing;
+    const rightX = worldLeftOffsetX + totalWidth;
+    const desiredTarget = new THREE.Vector3(
+      rightX + flyCamAnchor.dxRight,
+      flyCamAnchor.targetY,
+      flyCamAnchor.targetZ
+    );
+    // Smoothly move target to follow the right edge
+    controls.target.lerp(desiredTarget, 0.12);
+    const desiredPos = controls.target.clone().add(flyCamAnchor.rel);
+    camera.position.lerp(desiredPos, 0.12);
+    controls.update();
   }
   controls.update();
   renderer.render(scene, camera);
@@ -1126,6 +1172,10 @@ function setAxesVisibility(visible) {
 }
 if (toggleAxesBtn) {
   toggleAxesBtn.addEventListener('click', () => setAxesVisibility(!axesVisible));
+}
+
+if (flyCamBtn) {
+  flyCamBtn.addEventListener('click', () => enableFlyCam(!flyCamActive));
 }
 
 function setPlayButtonState(isPlaying) {
@@ -1336,6 +1386,8 @@ resetBtn.addEventListener('click', () => {
   // Trim functionality removed; ensure any trim-specific disables are cleared (no-op)
   // After reset, ensure no recording-specific disables remain
   setControlsForRecording(false);
+  // Stop fly cam on reset
+  enableFlyCam(false);
 });
 
 fileInput.addEventListener('change', async (e) => {
