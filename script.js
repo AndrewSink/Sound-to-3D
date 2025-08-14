@@ -192,18 +192,6 @@ let positionAttr = geometry.attributes.position;
 let colors = new Float32Array(positionAttr.count * 3);
 geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 
-const material = new THREE.MeshLambertMaterial({
-  side: THREE.DoubleSide,
-  vertexColors: true,
-  emissive: new THREE.Color(0x0),
-});
-
-const surface = new THREE.Mesh(geometry, material);
-surface.position.x = 0; // center over ground grid
-scene.add(surface);
-// Hide the legacy deformable surface; we'll render per-slice modules instead
-surface.visible = false;
-
 // Enable per-slice geometry generation (append-only modules each frame)
 // Legacy deformable surface path is fully disabled
 const USE_PER_SLICE_GEOMETRY = true;
@@ -218,7 +206,7 @@ function clearSliceModules() {
   while (slicesGroup.children.length) {
     const child = slicesGroup.children.pop();
     if (child.geometry) child.geometry.dispose();
-    if (child.material && child.material.dispose && child.material !== wallsMaterial && child.material !== material) {
+    if (child.material && child.material.dispose && child.material !== wallsMaterial) {
       child.material.dispose();
     }
   }
@@ -361,8 +349,7 @@ let frontWallMesh = null;
 let leftWallMesh = null;
 let rightWallMesh = null;
 const wallsMaterial = new THREE.MeshLambertMaterial({ color: 0xb3b3b3, side: THREE.DoubleSide, toneMapped: false });
-// Ensure all mesh materials render double-sided to avoid culling artifacts
-material.side = THREE.DoubleSide;
+// Ensure helper mesh materials render double-sided to avoid culling artifacts
 wallsMaterial.side = THREE.DoubleSide;
 const topStripMaterial = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, toneMapped: false });
 
@@ -683,7 +670,6 @@ function expandGeometry(newCapacity) {
   oldGeometry.dispose();
   // Swap in the new geometry
   geometry = newGeo;
-  surface.geometry = geometry;
   positionAttr = geometry.attributes.position;
   colors = newColors;
   capacity = newCapacity;
@@ -724,8 +710,7 @@ function updateSurfaceFromFrequencies() {
   if (currentSliceIndex >= capacity) {
     const nextCapacity = Math.ceil(capacity * 1.6);
     expandGeometry(nextCapacity);
-    // Keep legacy surface hidden after growth
-    surface.visible = false;
+    // Legacy surface removed; per-slice modules remain the only visible geometry during growth
   }
 
   // For each z-row (frequency), write this slice at the current column
@@ -1169,8 +1154,6 @@ function animate() {
   requestAnimationFrame(animate);
   if ((isRecording || (!audioEl.paused && !hasEnded))) {
     updateSurfaceFromFrequencies();
-    // Only per-slice modules are rendered during growth; keep legacy surface hidden
-    surface.visible = false;
   }
   // As the model grows, ensure the frequency grid extends smoothly to the right
   ensureFrequencyAxisGridCoverage();
@@ -1700,8 +1683,7 @@ function finalizeModelGeometry(leftOffsetX = 0) {
   unifiedMesh = new THREE.Mesh(unifiedGeo, materials);
   scene.add(unifiedMesh);
 
-  // Hide legacy surface
-  surface.visible = false;
+  // Legacy deformable surface removed from render path; keep offset for export mapping
   worldLeftOffsetX = leftOffsetX;
 }
 
@@ -2247,8 +2229,7 @@ function resetVisualization() {
   geometry.attributes.color.needsUpdate = true;
   // Also clear any residual captured slices to avoid pre-populating export
   capturedSlices.length = 0;
-  // Keep legacy surface hidden; per-slice modules are the only visible geometry during growth
-  surface.visible = false;
+  // Per-slice modules are the only visible geometry during growth
   // Ensure grid renders below surface by resetting any modified order
   gridGroup.traverse((obj) => { obj.renderOrder = 0; });
   // Remove any watertight extrusions created previously
@@ -2263,16 +2244,16 @@ function resetVisualization() {
 function hardResetVisualization() {
   currentSliceIndex = 0;
   capacity = numSlicesInitial;
-  if (surface.geometry) surface.geometry.dispose();
   geometry = createSurfaceGeometry(capacity);
   applyZRowsToGeometry(geometry, capacity);
   positionAttr = geometry.attributes.position;
   colors = new Float32Array(positionAttr.count * 3);
   geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  surface.geometry = geometry;
   resetVisualization();
   buildAxesAndTicks();
   buildReferenceGrid(undefined, 0);
+  // Reset frequency grid coverage so it shrinks back to the initial span
+  lastBuiltFreqGridRightX = frequencyAxisX;
   buildFrequencyAxisGrid();
   // Reset world-space offset when fully resetting the scene
   worldLeftOffsetX = 0;
