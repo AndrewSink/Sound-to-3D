@@ -694,6 +694,8 @@ function expandGeometry(newCapacity) {
   buildAxesAndTicks();
   // Rebuild reference grid to match new width
   buildReferenceGrid(sliceSpacing * (newCapacity - 1));
+  // Rebuild frequency grid lines so they extend under new slices
+  buildFrequencyAxisGrid();
 }
 
 function updateSurfaceFromFrequencies() {
@@ -791,6 +793,27 @@ const frequencyAxisX = -2;
 // Infinite grid that renders only on the left side of the frequency axis (x <= frequencyAxisX)
 const freqGridGroup = new THREE.Group();
 scene.add(freqGridGroup);
+// Track how far to the right the frequency grid currently extends so we can
+// extend it smoothly as the model grows during playback.
+let lastBuiltFreqGridRightX = frequencyAxisX;
+// Grid growth behavior constants (in slices to keep scale consistent)
+const FREQ_GRID_EXTRA_MARGIN_SLICES = 64;   // lines extend this many slices beyond current edge
+const FREQ_GRID_MIN_INITIAL_SLICES = 128;   // minimum initial grid span to the right of axis
+// Brightness scale for grid lines (1 = default; >1 brighter, <1 dimmer)
+const FREQ_GRID_BRIGHTNESS = 1.5;
+// Extra Z margin so grid reaches slightly beyond the model's back/front edges
+const FREQ_GRID_Z_MARGIN = 2.0;
+
+function ensureFrequencyAxisGridCoverage() {
+  const axisX = frequencyAxisX;
+  const extraMargin = sliceSpacing * FREQ_GRID_EXTRA_MARGIN_SLICES;
+  const minInitial = sliceSpacing * FREQ_GRID_MIN_INITIAL_SLICES;
+  const desiredRight = axisX + Math.max(getCurrentMaxX() + extraMargin, minInitial);
+  // Rebuild when approaching the current right bound to keep growth smooth
+  if (desiredRight > lastBuiltFreqGridRightX - sliceSpacing * 4) {
+    buildFrequencyAxisGrid();
+  }
+}
 
 function clearFrequencyGrid() {
   while (freqGridGroup.children.length) {
@@ -802,11 +825,19 @@ function clearFrequencyGrid() {
 
 function buildFrequencyAxisGrid() {
   clearFrequencyGrid();
-  const size = 100000; // effectively infinite at our scene scale
-  const geo = new THREE.PlaneGeometry(size, size, 1, 1);
-  geo.rotateX(-Math.PI / 2);
-  // Place below the helper base so it never clips with geometry (extra 0.5 units down)
-  geo.translate(0, -baseThickness - 0.55, 0);
+  // Draw a simple line grid slightly below the base, to the RIGHT of the
+  // frequency axis only, and only across the frequency span 0..15k Hz.
+  const y = -baseThickness - 0.55;
+  const axisX = frequencyAxisX;
+  // Extend a margin past the current model width so the grid feels continuous
+  const extraMargin = sliceSpacing * 64; // ~64 slices beyond current edge
+  // Never shrink coverage; also ensure a minimum initial span
+  const minInitial = sliceSpacing * 128;
+  const desiredRight = axisX + Math.max(getCurrentMaxX() + extraMargin, minInitial);
+  const x1Prev = lastBuiltFreqGridRightX || axisX;
+  const x1 = Math.max(desiredRight, x1Prev);
+  const x0 = axisX;
+
   // Compute Z clipping range to show only between 0 Hz and 15k on the axis
   const nyquistHz = audioContext.sampleRate / 2;
   function zAtHz(hz) {
@@ -818,70 +849,55 @@ function buildFrequencyAxisGrid() {
     const activeIdx = Math.max(0, Math.min(activeRows - 1, idx));
     return zRowPositions[activeIdx];
   }
-  const zClipMin = zAtHz(0);
-  const zClipMax = zAtHz(15000);
-  const mat = new THREE.ShaderMaterial({
-    uniforms: {
-      uMinor: { value: 4.0 },
-      uMajor: { value: 20.0 },
-      uColorMinor: { value: new THREE.Color(0x3f3f46) },
-      uColorMajor: { value: new THREE.Color(0x3f3f46) },
-      uOpacity: { value: 0.65 },
-      uClipX: { value: frequencyAxisX - 1e-4 }, // include the axis line (right side)
-      uZMin: { value: Math.min(zClipMin, zClipMax) },
-      uZMax: { value: Math.max(zClipMin, zClipMax) },
-    },
-    transparent: true,
-    depthTest: true,
-    depthWrite: false,
-    toneMapped: false,
-    side: THREE.DoubleSide,
-    extensions: { derivatives: true },
-    vertexShader: `
-      varying vec3 vWorld;
-      void main(){
-        vec4 w = modelMatrix * vec4(position, 1.0);
-        vWorld = w.xyz;
-        gl_Position = projectionMatrix * viewMatrix * w;
-      }
-    `,
-    fragmentShader: `
-      varying vec3 vWorld;
-      uniform float uMinor;
-      uniform float uMajor;
-      uniform vec3 uColorMinor;
-      uniform vec3 uColorMajor;
-      uniform float uOpacity;
-      uniform float uClipX;
-      uniform float uZMin;
-      uniform float uZMax;
+  // Cover the full model depth with a small margin so the grid fully tucks under
+  const z0 = zMin - FREQ_GRID_Z_MARGIN;
+  const z1 = zMax + FREQ_GRID_Z_MARGIN;
 
-      float gridFactor(vec2 p, float step, float width){
-        vec2 q = p / step;
-        vec2 w = abs(fract(q - 0.5) - 0.5) / fwidth(q);
-        float line = min(w.x, w.y);
-        return 1.0 - smoothstep(width, width + 1.0, line);
-      }
+  // Major/minor spacing in world units (match previous shader defaults)
+  const MINOR_STEP = 4.0;
+  const MAJOR_STEP = 20.0;
+  const RATIO_X = Math.max(1, Math.round(MAJOR_STEP / MINOR_STEP));
+  const RATIO_Z = RATIO_X; // same step sizes in both axes
 
-      void main(){
-        // Show only on the RIGHT side of the frequency axis
-        if (vWorld.x < uClipX) discard;
-        // Restrict to 0..15k Hz span on Z
-        if (vWorld.z < uZMin || vWorld.z > uZMax) discard;
-        vec2 p = vWorld.xz;
-        float minor = gridFactor(p, uMinor, 0.8);
-        float major = gridFactor(p, uMajor, 1.2);
-        float a = max(major, minor * 0.6) * uOpacity;
-        vec3 col = mix(uColorMinor, uColorMajor, step(minor, major));
-        gl_FragColor = vec4(col, a);
-      }
-    `,
-  });
-  const mesh = new THREE.Mesh(geo, mat);
-  // Render the grid before opaque geometry; since it doesn't write depth,
-  // later draws (spectrogram/base) will fully occlude it.
-  mesh.renderOrder = -100;
-  freqGridGroup.add(mesh);
+  const segmentsMinor = [];
+  const segmentsMajor = [];
+  // Lines parallel to X across Z
+  const nMinorZ = Math.max(0, Math.floor((z1 - z0) / MINOR_STEP));
+  for (let i = 0; i <= nMinorZ; i++) {
+    const z = z0 + MINOR_STEP * i;
+    const isMajor = (i % RATIO_Z) === 0;
+    (isMajor ? segmentsMajor : segmentsMinor).push(x0, y, z, x1, y, z);
+  }
+  // Lines parallel to Z across X
+  const nMinorX = Math.max(0, Math.floor((x1 - x0) / MINOR_STEP));
+  for (let i = 0; i <= nMinorX; i++) {
+    const x = x0 + MINOR_STEP * i;
+    const isMajor = (i % RATIO_X) === 0;
+    (isMajor ? segmentsMajor : segmentsMinor).push(x, y, z0, x, y, z1);
+  }
+
+  function addLineSegments(segments, opacity) {
+    if (!segments.length) return;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(segments), 3));
+    const mat = new THREE.LineBasicMaterial({
+      color: 0x3f3f46,
+      transparent: true,
+      opacity: Math.max(0, Math.min(1, opacity * FREQ_GRID_BRIGHTNESS)),
+      depthTest: true,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    const lines = new THREE.LineSegments(geo, mat);
+    lines.renderOrder = -100;
+    freqGridGroup.add(lines);
+  }
+
+  addLineSegments(segmentsMinor, 0.35);
+  addLineSegments(segmentsMajor, 0.65);
+
+  // Record current rightmost coverage so we can extend smoothly later
+  lastBuiltFreqGridRightX = x1;
 }
 
 function disposeObjectRecursive(object3d) {
@@ -1156,6 +1172,8 @@ function animate() {
     // Only per-slice modules are rendered during growth; keep legacy surface hidden
     surface.visible = false;
   }
+  // As the model grows, ensure the frequency grid extends smoothly to the right
+  ensureFrequencyAxisGridCoverage();
   // Update fly cam position to maintain angle and pull back as width grows
   if (flyCamActive && flyCamAnchor) {
     const slices = Math.max(currentSliceIndex, capturedSlices.length);
@@ -2255,6 +2273,7 @@ function hardResetVisualization() {
   resetVisualization();
   buildAxesAndTicks();
   buildReferenceGrid(undefined, 0);
+  buildFrequencyAxisGrid();
   // Reset world-space offset when fully resetting the scene
   worldLeftOffsetX = 0;
   // Make sure all extrusions are deleted on a hard reset
